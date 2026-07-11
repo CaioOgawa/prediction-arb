@@ -1,0 +1,7 @@
+accuracy,f1_weighted,auc_roc,brier_score,log_loss,model,train_time
+0.5762,0.5575,0.5659,0.2453,0.6833,lightgbm_calibrated,2.2
+0.5485,0.5486,0.559,0.2995,0.8713,lightgbm,1.7
+0.5319,0.5321,0.5439,0.2821,0.7859,xgboost,0.3
+0.518,0.5177,0.5203,0.2531,0.6997,logistic_calibrated,0.0
+0.5291,0.5065,0.5175,0.2517,0.6969,logistic_regression,0.0
+0.5208,0.4837,0.5148,0.2501,0.6946,xgboost_calibrated,0.6

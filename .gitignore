@@ -1,0 +1,40 @@
+# Credenciais — NUNCA commitar
+.env
+*.pem
+*.key
+
+# Notas locais
+idea.md
+logs/
+
+# Dados locais
+data/
+outputs/
+*.parquet
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Models salvos (podem ser grandes)
+*.pkl
+*.joblib
+*.pt
+*.pth
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Relatórios de backtest (gerados)
+backtest/results/
