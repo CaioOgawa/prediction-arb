@@ -429,14 +429,15 @@ def bs_prob(S: float, K: float, T: float, sigma: float,
                               *em algum ponto* antes de T.
                               Usado para "Will BTC reach/hit $X by [date]?".
 
-    Fórmulas (first-passage time com drift μ = r - σ²/2):
+    Fórmulas (first-passage time com drift μ = r - σ²/2; Harrison,
+    "Brownian Motion and Stochastic Flow Systems", §1.8):
       Upward (above=True):
-        P(max S_t > K) = N(d₂) + exp(2μ ln(S/K) / σ²) × N(d₁ - 2ln(S/K)/(σ√T))
+        P(max S_t ≥ K) = N(d₂) + exp(2μ ln(K/S) / σ²) × N(-d₂ - 2ln(K/S)/(σ√T))
 
       Downward (above=False):
-        P(min S_t < K) = N(-d₂) + exp(2μ ln(K/S) / σ²) × N(-d₁ + 2ln(K/S)/(σ√T))
+        P(min S_t ≤ K) = N(-d₂) + exp(2μ ln(K/S) / σ²) × N(d₂ + 2ln(K/S)/(σ√T))
 
-      Onde d₁ = [ln(S/K) + (r + σ²/2)T] / (σ√T),  d₂ = d₁ - σ√T
+      Onde d₂ = [ln(S/K) + μT] / (σ√T)
 
     Args:
         S:     preço spot atual
@@ -452,30 +453,24 @@ def bs_prob(S: float, K: float, T: float, sigma: float,
     if sigma <= 0:
         return (1.0 if S > K else 0.0) if above else (1.0 if S < K else 0.0)
 
-    sqrtT = sigma * np.sqrt(T)
-    d1    = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / sqrtT
-    d2    = d1 - sqrtT
-    mu    = r - 0.5 * sigma ** 2  # drift do log-preço
+    sig_sqrtT = sigma * np.sqrt(T)              # σ√T — não √T, o nome antigo "sqrtT" enganava
+    mu        = r - 0.5 * sigma ** 2            # drift do log-preço
+    d2        = (np.log(S / K) + mu * T) / sig_sqrtT
 
     if not touch:
         # Opção europeia: P(S_T > K) = N(d₂) sob medida P com drift r
         return float(norm.cdf(d2) if above else norm.cdf(-d2))
 
     # Opção barreira (first-passage time com drift)
+    log_KS = np.log(K / S)
+    factor = np.exp(2.0 * mu * log_KS / sigma ** 2)
+    arg    = d2 + 2.0 * log_KS / sig_sqrtT
     if above:
-        # P(max_{0,T} S_t > K): barreira upward
-        # = N(d₂) + exp(2μ ln(S/K) / σ²) × N(d₁ - 2ln(S/K)/(σ√T))
-        log_SK = np.log(S / K)
-        factor = np.exp(2.0 * mu * log_SK / sigma ** 2)
-        arg2   = d1 - 2.0 * log_SK / sqrtT
-        p_touch = float(norm.cdf(d2) + factor * norm.cdf(arg2))
+        # P(max_{0,T} S_t ≥ K) = N(d₂) + exp(2μ ln(K/S)/σ²) × N(-arg)
+        p_touch = float(norm.cdf(d2) + factor * norm.cdf(-arg))
     else:
-        # P(min_{0,T} S_t < K): barreira downward
-        # = N(-d₂) + exp(2μ ln(K/S) / σ²) × N(-d₁ + 2ln(K/S)/(σ√T))
-        log_KS = np.log(K / S)
-        factor = np.exp(2.0 * mu * log_KS / sigma ** 2)
-        arg2   = -d1 + 2.0 * log_KS / sqrtT
-        p_touch = float(norm.cdf(-d2) + factor * norm.cdf(arg2))
+        # P(min_{0,T} S_t ≤ K) = N(-d₂) + exp(2μ ln(K/S)/σ²) × N(arg)
+        p_touch = float(norm.cdf(-d2) + factor * norm.cdf(arg))
 
     return float(np.clip(p_touch, 0.0, 1.0))
 

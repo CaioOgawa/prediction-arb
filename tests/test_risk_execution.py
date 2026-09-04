@@ -230,6 +230,57 @@ class TestTouchDirection:
 
 
 # ──────────────────────────────────────────────────────────
+# deribit_collector — bs_prob (P0-1: barreira saturava em 1.0 para todo touch upward)
+# ──────────────────────────────────────────────────────────
+
+class TestBSProbBarrier:
+    """
+    bs_prob() é função pura de first-passage time. Antes do fix ela tinha dois
+    erros de sinal (fórmula construída a partir de d1 em vez de d2, e o fator
+    exponencial usava ln(S/K) em vez de ln(K/S)) que faziam TODO touch upward
+    saturar em 1.000000, independente de quão longe o strike estivesse do spot.
+
+    Valores de referência: Monte Carlo com 200k trajetórias e 1000 passos por
+    ano (auditoria MELHORIAS_2026-09-03.md, P0-1). MC discreto tem viés
+    negativo conhecido para probabilidade de barreira (pode pular o toque
+    entre passos), por isso a tolerância é generosa (3pp).
+    """
+
+    @pytest.mark.parametrize("K, above, mc_prob", [
+        (105, True, 0.8312),
+        (110, True, 0.6988),
+        (130, True, 0.3237),
+        (90, False, 0.7506),
+        (70, False, 0.2718),
+    ])
+    def test_contra_monte_carlo(self, K, above, mc_prob):
+        p = deribit_collector.bs_prob(S=100, K=K, T=0.25, sigma=0.6, r=0.0, above=above, touch=True)
+        assert abs(p - mc_prob) < 0.03
+
+    def test_nao_satura_em_1_para_strikes_distantes(self):
+        """Bug original: todo K acima do spot dava exatamente 1.0."""
+        probs = [
+            deribit_collector.bs_prob(S=100, K=K, T=0.25, sigma=0.6, r=0.0, above=True, touch=True)
+            for K in [105, 110, 130, 200, 500]
+        ]
+        assert all(p < 0.999 for p in probs)
+        # monotonicamente decrescente conforme o strike se afasta do spot
+        assert probs == sorted(probs, reverse=True)
+
+    def test_atm_da_probabilidade_1(self):
+        """S == K: o preço já está na barreira, toque é certo."""
+        p = deribit_collector.bs_prob(S=100, K=100, T=0.25, sigma=0.6, r=0.0, above=True, touch=True)
+        assert p == pytest.approx(1.0, abs=1e-9)
+
+    def test_europeia_nao_regride(self):
+        """Ramo europeu (touch=False) já estava correto — não pode ter mudado."""
+        p_above = deribit_collector.bs_prob(S=100, K=110, T=0.25, sigma=0.6, r=0.0, above=True, touch=False)
+        p_below = deribit_collector.bs_prob(S=100, K=110, T=0.25, sigma=0.6, r=0.0, above=False, touch=False)
+        assert p_above == pytest.approx(1.0 - p_below, abs=1e-9)
+        assert 0.0 < p_above < 0.5  # K acima do spot, sem drift → P(S_T > K) < 50%
+
+
+# ──────────────────────────────────────────────────────────
 # risk_manager — double-credit e Kelly
 # ──────────────────────────────────────────────────────────
 
