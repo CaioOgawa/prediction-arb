@@ -1828,6 +1828,217 @@ def _fake_market_row(condition_id, question, yes_price, best_bid, best_ask, spre
     }
 
 
+class TestExtractFairProbsSemDrawFantasma:
+    """P1-22: nomes de outcome cosmeticamente diferentes de home_team/away_team
+    (comparação exata antes deste fix) caíam no else e viravam "draw" —
+    inclusive em esporte de 2 vias, sem empate possível (NBA)."""
+
+    def _event(self, home_team, away_team, outcome_names, odds=(1.60, 2.50), sport_key="basketball_nba"):
+        return {
+            "sport_key": sport_key,
+            "home_team": home_team,
+            "away_team": away_team,
+            "bookmakers": [{
+                "key": "pinnacle",
+                "markets": [{
+                    "key": "h2h",
+                    "outcomes": [
+                        {"name": outcome_names[0], "price": odds[0]},
+                        {"name": outcome_names[1], "price": odds[1]},
+                    ],
+                }],
+            }],
+        }
+
+    def test_nome_com_alias_conhecido_nao_fabrica_draw(self):
+        # event.home_team usa a forma abreviada; o outcome do bookmaker usa a
+        # forma canônica completa — ambos resolvem pro mesmo _normalize_team.
+        event = self._event(
+            home_team="LA Lakers", away_team="LA Clippers",
+            outcome_names=["Los Angeles Lakers", "Los Angeles Clippers"],
+        )
+        fair = odds_collector.extract_fair_probs(event)
+        assert fair is not None
+        assert "draw" not in fair
+        assert "home" in fair and "away" in fair
+
+    def test_nome_sem_alias_conhecido_descarta_o_book_em_vez_de_dar_draw(self):
+        # "LAL" não está em TEAM_ALIASES/SPORT_ALIASES — não bate com home
+        # nem away por nome, e não é "draw"/"tie"/"empate" literal. Antes do
+        # fix isso virava book_entry["draw"]; agora o book inteiro é descartado.
+        event = self._event(
+            home_team="Los Angeles Lakers", away_team="Los Angeles Clippers",
+            outcome_names=["LAL", "LAC"],
+        )
+        fair = odds_collector.extract_fair_probs(event)
+        assert fair is None  # único book, descartado → nenhum book válido
+
+    def test_draw_literal_em_futebol_ainda_funciona(self):
+        # Outcome "Draw" de verdade (esporte de 3 vias) continua sendo
+        # reconhecido — o fix não deve quebrar o caso legítimo.
+        event = {
+            "sport_key": "soccer_epl",
+            "home_team": "Arsenal",
+            "away_team": "Chelsea",
+            "bookmakers": [{
+                "key": "pinnacle",
+                "markets": [{
+                    "key": "h2h",
+                    "outcomes": [
+                        {"name": "Arsenal", "price": 2.10},
+                        {"name": "Chelsea", "price": 3.40},
+                        {"name": "Draw", "price": 3.60},
+                    ],
+                }],
+            }],
+        }
+        fair = odds_collector.extract_fair_probs(event)
+        assert fair is not None
+        assert "draw" in fair and "home" in fair and "away" in fair
+
+    def test_terceiro_outcome_nao_literal_ainda_vira_draw_por_eliminacao(self):
+        # Revisão advisor: um bookmaker que rotula o empate como "Tie (90 mins)"
+        # em vez de "Draw" exato não pode derrubar o book inteiro — home e away
+        # já bateram por nome, e num mercado de 3 vias o único outcome que sobra
+        # só pode ser o empate. Descartar o book aqui jogaria fora probabilidades
+        # boas de home/away por causa de um rótulo de terceira via não reconhecido.
+        event = {
+            "sport_key": "soccer_epl",
+            "home_team": "Arsenal",
+            "away_team": "Chelsea",
+            "bookmakers": [{
+                "key": "pinnacle",
+                "markets": [{
+                    "key": "h2h",
+                    "outcomes": [
+                        {"name": "Arsenal", "price": 2.10},
+                        {"name": "Chelsea", "price": 3.40},
+                        {"name": "Tie (90 mins)", "price": 3.60},
+                    ],
+                }],
+            }],
+        }
+        fair = odds_collector.extract_fair_probs(event)
+        assert fair is not None
+        assert "draw" in fair and "home" in fair and "away" in fair
+
+    def test_away_nao_identificado_descarta_mesmo_com_home_batendo(self):
+        # Só o home bate por nome ("Arsenal") — away não bate com "Chelsea"
+        # de jeito nenhum ("XYZ FC"). A eliminação por contagem exige home E
+        # away batidos antes de assumir a sobra como draw; com away ausente,
+        # nenhuma das probabilidades desse book é confiável — descarta.
+        event = {
+            "sport_key": "soccer_epl",
+            "home_team": "Arsenal",
+            "away_team": "Chelsea",
+            "bookmakers": [{
+                "key": "pinnacle",
+                "markets": [{
+                    "key": "h2h",
+                    "outcomes": [
+                        {"name": "Arsenal", "price": 2.10},
+                        {"name": "XYZ FC", "price": 3.40},
+                        {"name": "Tie (90 mins)", "price": 3.60},
+                    ],
+                }],
+            }],
+        }
+        fair = odds_collector.extract_fair_probs(event)
+        assert fair is None
+
+
+class TestOddsDirecaoConfrontosMesmaCidade:
+    """
+    P1-21: a versão antiga escolhia YES por posição de TOKEN isolado — em
+    confrontos da mesma cidade, tokens de cidade compartilhados ("los
+    angeles") empatavam as duas posições e o desempate escolhia sempre o
+    mandante, invertendo o lado. Quando nenhum time aparecia no texto, os
+    dois empatavam em len(text) e fair=0.5 (default) fabricava edge do nada.
+    """
+
+    def _match(self, mkt_row, event):
+        markets_df = pd.DataFrame([mkt_row])
+        return odds_collector.match_markets_to_odds(markets_df, [event], min_score=0.25)
+
+    def test_confronto_mesma_cidade_resolve_pro_time_certo_nao_pro_mandante(self):
+        # home=Clippers, away=Lakers — a pergunta menciona o Clippers primeiro.
+        # A versão antiga inverteria (tokens "los"/"angeles" empatados →
+        # escolhe home só por ser home). O nome completo "los angeles
+        # clippers" só bate na posição onde ELE aparece.
+        event = _fake_h2h_event("Los Angeles Clippers", "Los Angeles Lakers", 1.60, 2.50)
+        mkt = _fake_market_row(
+            "0xabc", "Will the Los Angeles Clippers beat the Los Angeles Lakers?",
+            yes_price=0.50, best_bid=0.47, best_ask=0.53, spread=0.06,
+        )
+        df = self._match(mkt, event)
+        assert not df.empty
+        assert df.iloc[0]["yes_team"] == "Los Angeles Clippers"
+
+    def test_nenhum_time_no_texto_nao_fabrica_edge(self):
+        # Pergunta genérica que não cita nenhum dos dois times pelo nome —
+        # antes, os dois empatavam em len(text) e caía no ramo "home" com
+        # fair=0,5 (fabricado). Agora não dá pra saber quem é YES → descarta.
+        event = _fake_h2h_event("Los Angeles Clippers", "Los Angeles Lakers", 1.60, 2.50)
+        mkt = _fake_market_row(
+            "0xabc", "Will the home team win tonight's game?",
+            yes_price=0.50, best_bid=0.47, best_ask=0.53, spread=0.06,
+        )
+        df = self._match(mkt, event)
+        assert df.empty
+
+    def test_time_visitante_citado_primeiro_resolve_pro_visitante(self):
+        # home=Lakers, away=Celtics, mas a pergunta cita o Celtics primeiro —
+        # YES precisa ser o Celtics (away), não o mandante por default.
+        event = _fake_h2h_event("Los Angeles Lakers", "Boston Celtics", 1.60, 2.50)
+        mkt = _fake_market_row(
+            "0xabc", "Will the Boston Celtics beat the Los Angeles Lakers?",
+            yes_price=0.50, best_bid=0.47, best_ask=0.53, spread=0.06,
+        )
+        df = self._match(mkt, event)
+        assert not df.empty
+        assert df.iloc[0]["yes_team"] == "Boston Celtics"
+
+    def test_repro_mets_yankees_do_documento_de_auditoria(self):
+        # Segunda linha da tabela de repro do P1-21 (a primeira é o teste do
+        # Lakers/Clippers acima): "Will the New York Mets beat the New York
+        # Yankees?" invertia pro mesmo motivo (tokens de cidade empatados).
+        event = _fake_h2h_event("New York Mets", "New York Yankees", 1.60, 2.50, sport_key="baseball_mlb")
+        mkt = _fake_market_row(
+            "0xabc", "Will the New York Mets beat the New York Yankees?",
+            yes_price=0.50, best_bid=0.47, best_ask=0.53, spread=0.06,
+        )
+        df = self._match(mkt, event)
+        assert not df.empty
+        assert df.iloc[0]["yes_team"] == "New York Mets"
+
+    def test_todos_os_pares_da_mesma_cidade_resolvem_pro_time_citado_primeiro(self):
+        # Revisão advisor: em vez de só os pares escolhidos à mão acima,
+        # varre TODO par de times que compartilha cidade em TEAM_ALIASES —
+        # se algum alias curto colidisse como substring do nome completo do
+        # rival (o risco geral que o fix busca evitar), apareceria aqui como
+        # inversão ou queda inesperada num desses pares reais.
+        by_city: dict[str, list[str]] = {}
+        for canonical in set(odds_collector.TEAM_ALIASES.values()):
+            city = canonical.rsplit(" ", 1)[0]  # "los angeles lakers" -> "los angeles"
+            by_city.setdefault(city, []).append(canonical)
+
+        pairs = [(names[0], names[1]) for names in by_city.values() if len(names) >= 2]
+        assert len(pairs) >= 5  # sanity: a varredura está de fato pegando pares reais
+
+        failures = []
+        for team_a, team_b in pairs:
+            event = _fake_h2h_event(team_a.title(), team_b.title(), 1.60, 2.50)
+            mkt = _fake_market_row(
+                "0xabc", f"Will the {team_a.title()} beat the {team_b.title()}?",
+                yes_price=0.50, best_bid=0.47, best_ask=0.53, spread=0.06,
+            )
+            df = self._match(mkt, event)
+            if df.empty or df.iloc[0]["yes_team"] != team_a.title():
+                failures.append((team_a, team_b, df.iloc[0]["yes_team"] if not df.empty else "VAZIO"))
+
+        assert failures == [], f"pares que não resolveram pro time citado primeiro: {failures}"
+
+
 class TestMatchMarketsToOddsEntryPrice:
     def _match(self, mkt_row, event):
         markets_df = pd.DataFrame([mkt_row])

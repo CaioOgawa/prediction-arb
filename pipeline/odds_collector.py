@@ -324,24 +324,56 @@ def extract_fair_probs(event: dict) -> dict[str, float] | None:
 
             fair_probs, _vig_method = _choose_remove_vig(raw_probs)
 
+            # P1-22: o else abaixo jogava em "draw" qualquer outcome cujo nome
+            # não batesse EXATAMENTE com home_team/away_team — em evento de 2
+            # vias com nomes cosmeticamente diferentes ("L.A. Lakers" vs
+            # "Los Angeles Lakers"), os dois caíam em draw (fantasma) e as
+            # linhas de fallback abaixo preenchiam home/away por POSIÇÃO, não
+            # por nome. Agora casa via _normalize_team (mesmas variantes
+            # canônicas do matching de pergunta↔evento) e, se um outcome não
+            # bate com home nem away nem é literalmente draw/tie/empate, o
+            # book inteiro é descartado — nunca infere por posição.
+            sport_key_ev = event.get("sport_key", "")
+            home_norm = _normalize_team(home_team, sport_key_ev)
+            away_norm = _normalize_team(away_team, sport_key_ev)
+
             book_entry: dict = {
                 "bookmaker":  bm.get("key", "unknown"),
                 "overround":  overround,
                 "is_sharp":   bm.get("key", "") in SHARP_BOOKS,
                 "vig_method": _vig_method,
             }
+            unmatched: list[int] = []
             for i, team in enumerate(teams):
-                if team == home_team:
+                team_norm = _normalize_team(team, sport_key_ev)
+                if team_norm == home_norm:
                     book_entry["home"] = fair_probs[i]
-                elif team == away_team:
+                elif team_norm == away_norm:
                     book_entry["away"] = fair_probs[i]
-                else:
+                elif team.strip().lower() in ("draw", "tie", "empate"):
                     book_entry["draw"] = fair_probs[i]
+                else:
+                    unmatched.append(i)
 
-            if "home" not in book_entry and len(fair_probs) >= 1:
-                book_entry["home"] = fair_probs[0]
-            if "away" not in book_entry and len(fair_probs) >= 2:
-                book_entry["away"] = fair_probs[1]
+            # home/away têm que bater por nome — sem isso não dá pra confiar
+            # em nenhum valor do book. Um único outcome sobrando num mercado
+            # de 3 vias (home+away já batidos) é quase sempre o empate por
+            # eliminação; mais de um sobrando, ou sobra num mercado de 2
+            # vias, é genuinamente ambíguo — descarta em vez de adivinhar.
+            if "home" not in book_entry or "away" not in book_entry:
+                logger.debug(
+                    f"  Skipping {bm.get('key')} — home/away não batem com "
+                    f"nomes conhecidos ({home_team!r}/{away_team!r})"
+                )
+                continue
+            if len(unmatched) == 1 and len(teams) == 3 and "draw" not in book_entry:
+                book_entry["draw"] = fair_probs[unmatched[0]]
+            elif unmatched:
+                logger.debug(
+                    f"  Skipping {bm.get('key')} — outcome(s) não identificado(s) "
+                    f"além de home/away: {[teams[i] for i in unmatched]}"
+                )
+                continue
 
             valid_books.append(book_entry)
             break  # um mercado H2H por bookmaker
@@ -805,8 +837,9 @@ def match_markets_to_odds(
         if fair is None:
             continue
 
-        home_team = best_match.get("home_team", "")
-        away_team = best_match.get("away_team", "")
+        home_team    = best_match.get("home_team", "")
+        away_team    = best_match.get("away_team", "")
+        sport_key_val = best_match.get("sport_key", "")
         q_lower   = question.lower()
 
         if is_draw_market:
@@ -821,22 +854,43 @@ def match_markets_to_odds(
         else:
             # Mercado de vitória: YES = time que aparece PRIMEIRO na pergunta.
             # Padrão Polymarket: "[Time A] vs. [Time B]" → YES = Time A.
-            def _first_token_pos(team: str, text: str) -> int:
-                tokens = team.lower().split()
-                positions = [text.find(tok) for tok in tokens if tok in text]
-                return min(positions) if positions else len(text)
+            #
+            # P1-21: a versão antiga comparava por TOKEN isolado (min sobre
+            # `text.find(tok)` de cada palavra do nome) — confrontos da mesma
+            # cidade ("Los Angeles Clippers" vs "Los Angeles Lakers") têm
+            # tokens de cidade compartilhados que casam na MESMA posição pros
+            # dois lados, e o desempate (`<=`) sempre escolhia o mandante. Um
+            # jogo 55/45 assim invertia pra um "edge" de ~10pp que passava
+            # por todos os filtros. Pior: quando nenhum time aparecia no
+            # texto, os dois empatavam em len(text) e o default fair=0,5
+            # fabricava um "edge" do nada.
+            #
+            # Corrigido: casa a STRING completa de cada variante conhecida
+            # (_team_variants — mesmas usadas no matching pergunta↔evento),
+            # não token a token — "los angeles lakers" só bate na posição
+            # onde ESSE nome aparece, nunca na do adversário. Exige vencedor
+            # estrito; ausência ou empate de posição não adivinha, pula.
+            def _team_pos(team: str, text: str) -> int:
+                positions = [
+                    text.find(v) for v in _team_variants(team, sport_key_val)
+                    if v and v in text
+                ]
+                return min(positions) if positions else -1
 
-            home_pos = _first_token_pos(home_team, q_lower)
-            away_pos = _first_token_pos(away_team, q_lower)
+            home_pos = _team_pos(home_team, q_lower)
+            away_pos = _team_pos(away_team, q_lower)
 
-            if home_pos <= away_pos:
-                fair_yes = fair.get("home", 0.5)
-                fair_no  = fair.get("away", 0.5)
-                yes_team = home_team
+            if home_pos == -1 and away_pos == -1:
+                continue  # nenhum dos dois nomes aparece no texto — não dá pra saber quem é YES
+            if home_pos != -1 and (away_pos == -1 or home_pos < away_pos):
+                fair_yes, fair_no, yes_team = fair.get("home"), fair.get("away"), home_team
+            elif away_pos != -1 and (home_pos == -1 or away_pos < home_pos):
+                fair_yes, fair_no, yes_team = fair.get("away"), fair.get("home"), away_team
             else:
-                fair_yes = fair.get("away", 0.5)
-                fair_no  = fair.get("home", 0.5)
-                yes_team = away_team
+                continue  # empate exato de posição — ambíguo, não adivinha
+
+            if fair_yes is None or fair_no is None:
+                continue  # book não deu esse lado — não fabrica 0,5
 
         divergence = round(yes_price - fair_yes, 4)
 
@@ -860,7 +914,6 @@ def match_markets_to_odds(
             continue  # sem book confiável nesse lado, ou spread come o edge mínimo
         entry_price, book_spread, net_edge = priced
 
-        sport_key_val = best_match.get("sport_key", "")
         rows.append({
             "condition_id":     mkt.get("conditionId"),
             "question":         question,
