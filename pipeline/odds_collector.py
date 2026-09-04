@@ -657,9 +657,24 @@ SPORT_ALIASES: dict[str, dict[str, str]] = {
 _REVERSE_ALIASES: dict[str, set[str]] = {}
 for _alias, _canon in TEAM_ALIASES.items():
     _REVERSE_ALIASES.setdefault(_canon, set()).add(_alias)
-for _sport_map in SPORT_ALIASES.values():
+
+# P1-21 (achado na revisão): apelidos de SPORT_ALIASES são ambíguos ENTRE
+# esportes por design — é por isso que não vivem no TEAM_ALIASES global (ver
+# comentário acima de SPORT_ALIASES sobre o bug de 2026-07 do "spurs"). Um
+# reverse-lookup GLOBAL (todos os sport_maps despejados no mesmo dict, como
+# esta função fazia antes) reintroduz exatamente essa ambiguidade pela porta
+# dos fundos: "washington" (apelido de "Washington Commanders" só no
+# americanfootball) virava variante de busca mesmo com sport_key de outro
+# esporte, colidindo com qualquer time começando com "Washington" nele (ex:
+# Washington Capitals, NHL). Por isso os apelidos de SPORT_ALIASES ficam num
+# mapa reverso separado, escopado por grupo de esporte — _team_variants só
+# consulta o grupo do sport_key recebido.
+_REVERSE_ALIASES_BY_SPORT: dict[str, dict[str, set[str]]] = {}
+for _sport_group_name, _sport_map in SPORT_ALIASES.items():
+    _rev: dict[str, set[str]] = {}
     for _alias, _canon in _sport_map.items():
-        _REVERSE_ALIASES.setdefault(_canon, set()).add(_alias)
+        _rev.setdefault(_canon, set()).add(_alias)
+    _REVERSE_ALIASES_BY_SPORT[_sport_group_name] = _rev
 
 
 def _sport_group(sport_key: str) -> str:
@@ -684,6 +699,7 @@ def _team_variants(team_raw: str, sport_key: str = "") -> set[str]:
     canonical = _normalize_team(team_raw, sport_key)
     variants = {team_raw.lower().strip(), canonical}
     variants |= _REVERSE_ALIASES.get(canonical, set())
+    variants |= _REVERSE_ALIASES_BY_SPORT.get(_sport_group(sport_key), {}).get(canonical, set())
     return variants
 
 

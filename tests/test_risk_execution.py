@@ -2011,32 +2011,54 @@ class TestOddsDirecaoConfrontosMesmaCidade:
         assert not df.empty
         assert df.iloc[0]["yes_team"] == "New York Mets"
 
-    def test_todos_os_pares_da_mesma_cidade_resolvem_pro_time_citado_primeiro(self):
-        # Revisão advisor: em vez de só os pares escolhidos à mão acima,
-        # varre TODO par de times que compartilha cidade em TEAM_ALIASES —
-        # se algum alias curto colidisse como substring do nome completo do
-        # rival (o risco geral que o fix busca evitar), apareceria aqui como
-        # inversão ou queda inesperada num desses pares reais.
-        by_city: dict[str, list[str]] = {}
-        for canonical in set(odds_collector.TEAM_ALIASES.values()):
-            city = canonical.rsplit(" ", 1)[0]  # "los angeles lakers" -> "los angeles"
-            by_city.setdefault(city, []).append(canonical)
+    # Rivais reais da mesma cidade que jogam entre si de verdade — pares
+    # cross-sport (ex: "Washington Capitals" x "Washington Commanders", NHL x
+    # NFL) nunca aparecem no mesmo mercado, então não entram aqui: variam o
+    # sport_key certo do par, não uma cidade qualquer.
+    SAME_CITY_RIVALS = [
+        ("Los Angeles Lakers", "Los Angeles Clippers", "basketball_nba"),
+        ("New York Knicks", "Brooklyn Nets", "basketball_nba"),
+        ("New York Mets", "New York Yankees", "baseball_mlb"),
+        ("Los Angeles Dodgers", "Los Angeles Angels", "baseball_mlb"),
+        ("Chicago Cubs", "Chicago White Sox", "baseball_mlb"),
+        ("New York Giants", "New York Jets", "americanfootball_nfl"),
+        ("Los Angeles Rams", "Los Angeles Chargers", "americanfootball_nfl"),
+        ("New York Rangers", "New York Islanders", "icehockey_nhl"),
+    ]
 
-        pairs = [(names[0], names[1]) for names in by_city.values() if len(names) >= 2]
-        assert len(pairs) >= 5  # sanity: a varredura está de fato pegando pares reais
-
+    def test_rivais_reais_da_mesma_cidade_resolvem_pro_time_citado_primeiro(self):
+        # Revisão advisor: em vez de só o par escolhido à mão acima, varre
+        # vários rivais reais de mesma cidade — se algum alias curto
+        # colidisse como substring do nome completo do rival, apareceria
+        # aqui como inversão ou queda inesperada num desses pares.
         failures = []
-        for team_a, team_b in pairs:
-            event = _fake_h2h_event(team_a.title(), team_b.title(), 1.60, 2.50)
+        for team_a, team_b, sport_key in self.SAME_CITY_RIVALS:
+            event = _fake_h2h_event(team_a, team_b, 1.60, 2.50, sport_key=sport_key)
             mkt = _fake_market_row(
-                "0xabc", f"Will the {team_a.title()} beat the {team_b.title()}?",
+                "0xabc", f"Will the {team_a} beat the {team_b}?",
                 yes_price=0.50, best_bid=0.47, best_ask=0.53, spread=0.06,
             )
             df = self._match(mkt, event)
-            if df.empty or df.iloc[0]["yes_team"] != team_a.title():
+            if df.empty or df.iloc[0]["yes_team"] != team_a:
                 failures.append((team_a, team_b, df.iloc[0]["yes_team"] if not df.empty else "VAZIO"))
 
         assert failures == [], f"pares que não resolveram pro time citado primeiro: {failures}"
+
+    def test_apelido_de_sport_alias_nao_vaza_pra_outro_esporte(self):
+        # Achado na revisão: _REVERSE_ALIASES antes despejava os apelidos de
+        # TODOS os esportes no mesmo dict global — "washington" (apelido só
+        # do americanfootball, "Washington Commanders") virava variante de
+        # busca mesmo com sport_key de outro esporte, colidindo com QUALQUER
+        # time começando com "Washington" nesse esporte (ex: Washington
+        # Capitals, NHL — nunca jogam entre si, mas se aparecessem no mesmo
+        # texto por acidente, empatavam por posição). Escopado por esporte:
+        # "washington" não pode ser variante de "Washington Commanders" fora
+        # do sport_key de futebol americano.
+        variants_wrong_sport = odds_collector._team_variants("Washington Commanders", "icehockey_nhl")
+        assert "washington" not in variants_wrong_sport
+
+        variants_right_sport = odds_collector._team_variants("Washington Commanders", "americanfootball_nfl")
+        assert "washington" in variants_right_sport
 
 
 class TestMatchMarketsToOddsEntryPrice:
