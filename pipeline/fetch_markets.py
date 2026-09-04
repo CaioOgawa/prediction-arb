@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-from gamma_collector import run as collect_markets
+from gamma_collector import run as collect_markets, EmptySnapshotError
 
 console = Console()
 
@@ -201,10 +201,12 @@ def main(min_volume: float, report: bool) -> None:
     console.print(f"\n[bold]Polymarket Quant — Fase 1: Pipeline de Dados[/bold]")
     console.print(f"Coletando mercados com volume >= ${min_volume:,.0f} USDC...\n")
 
-    df = collect_markets(min_volume=min_volume)
-
-    if df.empty:
-        console.print("[red]Nenhum mercado retornado. Verifique a conexão com a Gamma API.[/red]")
+    try:
+        df = collect_markets(min_volume=min_volume)
+    except EmptySnapshotError as e:
+        console.print(f"[red]{e}[/red]")
+        console.print("[red]Verifique a conexão com a Gamma API — nenhum snapshot novo foi publicado "
+                       "(o último snapshot válido continua sendo o mais recente para o resto do sistema).[/red]")
         sys.exit(1)
 
     if report:

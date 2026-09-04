@@ -32,6 +32,11 @@ _API_URL   = f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage"
 HEARTBEAT_FILE = Path("data/heartbeat.json")
 
 
+def is_configured() -> bool:
+    """True se TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID estão setados no ambiente."""
+    return bool(_BOT_TOKEN and _CHAT_ID)
+
+
 def _send(text: str) -> bool:
     """Envia mensagem via Telegram. Retorna True se enviado."""
     if not _BOT_TOKEN or not _CHAT_ID:
@@ -84,8 +89,10 @@ def daily_summary(
     cash: float,
     win_rate: float | None = None,
 ) -> None:
-    """Resumo diário de P&L — enviado uma vez por dia."""
-    now    = datetime.now(timezone.utc)
+    """Resumo diário de P&L — enviado uma vez por dia (primeiro ciclo, hora < 1h UTC)."""
+    now = datetime.now(timezone.utc)
+    if now.hour != 0:
+        return
     arrow  = "📈" if pnl_usdc >= 0 else "📉"
     sign   = "+" if pnl_usdc >= 0 else ""
     wr_str = f"{win_rate:.1%}" if win_rate is not None else "—"
@@ -172,11 +179,14 @@ def write_heartbeat(failures: list[str]) -> None:
     import json
     HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
+    # P0-7: "alertable" separado de "status" — mesmo um ciclo OK precisa dizer
+    # que ninguém seria avisado se algo quebrasse (health check externo lê isto).
     data = {
         "last_cycle_at":  now.isoformat(),
         "last_cycle_ts":  int(now.timestamp()),
         "failures":       failures,
         "status":         "ok" if not failures else "degraded",
+        "alertable":      is_configured(),
     }
     HEARTBEAT_FILE.write_text(json.dumps(data, indent=2))
     logger.debug(f"Heartbeat escrito: {HEARTBEAT_FILE}")
@@ -212,5 +222,11 @@ if __name__ == "__main__":
         ok = _send("🔔 <b>Teste de conexão</b> — Polymarket Quant configurado corretamente!")
         print("Enviado!" if ok else "Falhou (verifique TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID no .env)")
     if args.heartbeat:
+        # P0-8: processo watchdog SEPARADO do run_cycle — precisa ser outro
+        # processo para significar alguma coisa (se o run_cycle travar antes
+        # de escrever o heartbeat, só um observador externo percebe).
+        # Antes disso, `--heartbeat` só imprimia no terminal e nunca alertava.
         alive, msg = check_heartbeat()
         print(f"{'✅' if alive else '🚨'} {msg}")
+        if not alive:
+            alert(f"Heartbeat morto: {msg}", cycle="watchdog")

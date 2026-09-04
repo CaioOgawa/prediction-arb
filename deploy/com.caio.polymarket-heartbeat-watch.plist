@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.caio.polymarket-heartbeat-watch</string>
+
+    <!--
+      P0-8: dead man's switch com observador SEPARADO do run_cycle.
+      Se o run_cycle travar ou morrer antes de escrever data/heartbeat.json,
+      só um processo diferente detecta isso — o próprio run_cycle não pode
+      ser o observador do seu próprio silêncio. Este job só lê o heartbeat
+      e alerta via Telegram se estiver stale; não toca em mercado nem em DB.
+
+      Instalar (não é feito automaticamente por código nenhum):
+        cp deploy/com.caio.polymarket-heartbeat-watch.plist ~/Library/LaunchAgents/
+        launchctl load ~/Library/LaunchAgents/com.caio.polymarket-heartbeat-watch.plist
+    -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/caio/.local/bin/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>/Users/caio/faculdade/projects/polymarket/notify.py</string>
+        <string>--heartbeat</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/caio/faculdade/projects/polymarket</string>
+
+    <!-- A cada 30 minutos (1800 segundos) — mesmo cadência do cycle-light,
+         mas processo independente: se o cycle travar, este continua rodando. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/caio/faculdade/projects/polymarket/logs/heartbeat_watch.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/caio/faculdade/projects/polymarket/logs/heartbeat_watch_error.log</string>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/caio</string>
+        <key>PATH</key>
+        <string>/Users/caio/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

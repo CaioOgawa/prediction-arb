@@ -167,6 +167,71 @@ class TestGammaKeyset:
         df = gamma_collector.fetch_markets(min_volume=0)
         assert df.empty
 
+    def test_falha_transitoria_recupera_via_retry(self, monkeypatch):
+        """P0-6: uma falha de rede isolada não pode derrubar a coleta inteira
+        — só a página falha, tenta de novo, e segue de onde parou."""
+        import requests as _requests
+
+        pages = [
+            {"markets": [_mk_market(i) for i in range(50)], "next_cursor": None},
+        ]
+        calls = {"n": 0}
+
+        def fake_get(url, params=None, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _requests.exceptions.ConnectionError("Failed to resolve host")
+            return _FakeResp(pages[0])
+
+        monkeypatch.setattr(gamma_collector.requests, "get", fake_get)
+        monkeypatch.setattr(gamma_collector.time, "sleep", lambda s: None)
+        df = gamma_collector.fetch_markets(min_volume=0)
+        assert len(df) == 50
+        assert calls["n"] == 2  # 1 falha + 1 sucesso no retry
+
+    def test_falha_persistente_nao_trava_alem_do_limite(self, monkeypatch):
+        """Após esgotar PAGE_MAX_RETRIES, desiste da página (não trava para sempre)."""
+        import requests as _requests
+
+        calls = {"n": 0}
+
+        def fake_get(url, params=None, timeout=None):
+            calls["n"] += 1
+            raise _requests.exceptions.ConnectionError("Failed to resolve host")
+
+        monkeypatch.setattr(gamma_collector.requests, "get", fake_get)
+        monkeypatch.setattr(gamma_collector.time, "sleep", lambda s: None)
+        df = gamma_collector.fetch_markets(min_volume=0)
+        assert df.empty
+        assert calls["n"] == gamma_collector.PAGE_MAX_RETRIES
+
+
+class TestSaveSnapshotNaoEnvenena:
+    """
+    P0-6: um snapshot vazio (falha transitória da Gamma API) gravado sob
+    markets_all_*/markets_incremental_* vira "o mais recente" para TODO
+    consumidor do sistema por até o próximo ciclo bem-sucedido — foi
+    exatamente isso que parou o pipeline inteiro (100% dos ciclos de um
+    dia com universo zerado, sem nenhum alerta).
+    """
+
+    def test_df_vazio_nao_grava_sob_nome_padrao(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gamma_collector, "RAW_DIR", tmp_path)
+        with pytest.raises(gamma_collector.EmptySnapshotError):
+            gamma_collector.save_snapshot(pd.DataFrame(), tag="all")
+
+        # Nada sob o nome que os loaders (mtime mais recente) enxergam
+        assert list(tmp_path.glob("markets_all_*.parquet")) == []
+        # O snapshot vazio ainda existe, mas sob um nome que ninguém glob-a
+        assert list(tmp_path.glob("markets_partial_all_*.parquet"))
+
+    def test_df_nao_vazio_grava_normalmente(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gamma_collector, "RAW_DIR", tmp_path)
+        df = pd.DataFrame([_mk_market(0)])
+        path = gamma_collector.save_snapshot(df, tag="all")
+        assert path.exists()
+        assert list(tmp_path.glob("markets_all_*.parquet")) == [path]
+
 
 # ──────────────────────────────────────────────────────────
 # odds_collector — aliases e matching

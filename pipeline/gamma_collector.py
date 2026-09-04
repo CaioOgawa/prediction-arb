@@ -24,6 +24,15 @@ RAW_DIR.mkdir(parents=True, exist_ok=True)
 # não um universo genuinamente pequeno (bug de 2026-05→07: universo travado em 100).
 MIN_EXPECTED_MARKETS = 300
 
+# Retry por página: uma falha de rede transitória (DNS, timeout) não pode
+# derrubar a coleta inteira e virar um snapshot vazio (P0-6).
+PAGE_MAX_RETRIES  = 3
+PAGE_BACKOFF_BASE = 2.0  # segundos: 2, 4, 8
+
+
+class EmptySnapshotError(Exception):
+    """Levantado quando a coleta não retornou nenhum mercado — ver save_snapshot()."""
+
 
 def _as_list(raw) -> list:
     """
@@ -160,12 +169,27 @@ def fetch_markets(
         if cursor:
             params["after_cursor"] = cursor
 
-        try:
-            resp = requests.get(f"{GAMMA_BASE}/markets/keyset", params=params, timeout=20)
-            resp.raise_for_status()
-            payload = resp.json()
-        except requests.RequestException as e:
-            logger.error(f"Erro na Gamma API (página {page+1}): {e}")
+        payload = None
+        for attempt in range(1, PAGE_MAX_RETRIES + 1):
+            try:
+                resp = requests.get(f"{GAMMA_BASE}/markets/keyset", params=params, timeout=20)
+                resp.raise_for_status()
+                payload = resp.json()
+                break
+            except requests.RequestException as e:
+                if attempt < PAGE_MAX_RETRIES:
+                    backoff = PAGE_BACKOFF_BASE * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Erro na Gamma API (página {page+1}, tentativa {attempt}/{PAGE_MAX_RETRIES}): "
+                        f"{e} — retry em {backoff:.0f}s"
+                    )
+                    time.sleep(backoff)
+                else:
+                    logger.error(
+                        f"Erro na Gamma API (página {page+1}) após {PAGE_MAX_RETRIES} tentativas: {e}"
+                    )
+
+        if payload is None:
             break
 
         if not isinstance(payload, dict):
@@ -214,8 +238,28 @@ def save_snapshot(df: pd.DataFrame, tag: str = "all") -> Path:
     """
     Salva snapshot de mercados em Parquet com timestamp.
     Retorna o caminho do arquivo salvo.
+
+    P0-6: um snapshot vazio (0 mercados — falha transitória de rede, DNS, etc.)
+    NUNCA é gravado sob o nome `markets_{tag}_*` que todo loader do sistema
+    (paper_trader, signal_generator, deribit_collector, ws_feed...) busca por
+    mtime mais recente. Gravar vazio ali "envenena" a leitura de todo mundo
+    pelos próximos ~30min (ou até o próximo ciclo bem-sucedido) — foi o que
+    parou o pipeline inteiro em 2026-09 (100% dos ciclos do dia com 0 mercados,
+    fail-open silencioso). O snapshot vazio ainda é salvo, mas com um prefixo
+    que nenhum glob de loader casa, e a função levanta para o chamador tratar
+    como falha de ciclo (ver EmptySnapshotError).
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    if df.empty:
+        path = RAW_DIR / f"markets_partial_{tag}_{ts}.parquet"
+        df.to_parquet(path, index=False, compression="snappy")
+        logger.error(
+            f"Coleta vazia — NÃO publicada como markets_{tag}_* (poison do fail-open). "
+            f"Salva para inspeção em {path}"
+        )
+        raise EmptySnapshotError(f"Gamma API devolveu 0 mercados — snapshot descartado ({path})")
+
     path = RAW_DIR / f"markets_{tag}_{ts}.parquet"
     df.to_parquet(path, index=False, compression="snappy")
     logger.info(f"Snapshot salvo: {path} ({len(df)} linhas)")
