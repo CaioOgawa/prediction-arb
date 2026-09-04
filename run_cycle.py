@@ -49,6 +49,18 @@ from notify import alert, write_heartbeat, daily_summary, is_configured as teleg
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 
+# P2-37: run_execution.py/ws_feed.py já rotacionam o próprio log; run_cycle.py
+# não tinha nenhum logger.add — a saída ia só pro StandardOutPath do plist
+# (launchd, fora deste repo), que nunca rotaciona sozinho. Isso não substitui
+# consertar o plist (P2-40), mas dá uma fonte de log limitada mesmo assim.
+logger.add(
+    LOGS_DIR / "cycle_{time:YYYY-MM-DD}.log",
+    rotation="1 day",
+    retention="7 days",
+    level="INFO",
+    format="{time:HH:mm:ss} | {level} | {message}",
+)
+
 LOCK_PATH = Path("data/run_cycle.lock")
 
 # P1-20: cada passo tem sua própria tolerância — fetch_markets/paper_trader
@@ -257,7 +269,12 @@ def main(full: bool, dry_run: bool, html_report: bool) -> None:
         # nome que os loaders veem) e o gate de frescor do P0-2 já rejeita
         # snapshot velho — os passos abaixo degradam pra no-op sozinhos
         # quando o mercado está stale, sem precisar de abort explícito.
-        ok = run(uv + ["pipeline/fetch_markets.py"], "fetch_markets")
+        # P2-37: --no-report — o relatório EDA (eda_markets_*.csv +
+        # top_markets_*.csv, ~5MB/ciclo) é pra exploração manual
+        # (features/eda.py, congelado pelo ADR-008), não pro ciclo
+        # automatizado. Sem isso, virou 3.106 arquivos / 15 GB em
+        # outputs/reports sozinho.
+        ok = run(uv + ["pipeline/fetch_markets.py", "--no-report"], "fetch_markets")
         if not ok:
             failures.append("fetch_markets")
             logger.error("fetch_markets falhou — seguindo com o último snapshot válido (se ainda fresco)")

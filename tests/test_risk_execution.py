@@ -2754,7 +2754,7 @@ class TestRunCycleTimeoutELock:
         # 1/4 dos ciclos de trading pra pouco ganho. Fica soft, sinais/
         # paper_trader seguem rodando (e degradam pra no-op sozinhos se o
         # snapshot ficar velho demais).
-        i_fetch = self.SRC.index('run(uv + ["pipeline/fetch_markets.py"]')
+        i_fetch = self.SRC.index('run(uv + ["pipeline/fetch_markets.py"')
         i_odds_step = self.SRC.index("# ── 2. Sinais odds")
         assert i_fetch < i_odds_step
         body_between = self.SRC[i_fetch:i_odds_step]
@@ -2768,3 +2768,16 @@ class TestRunCycleTimeoutELock:
 
     def test_chdir_pro_diretorio_do_script(self):
         assert "os.chdir(Path(__file__).resolve().parent)" in self.SRC
+
+    def test_fetch_markets_roda_sem_relatorio_eda(self):
+        # P2-37: eda_markets_*.csv + top_markets_*.csv (--report, default do
+        # fetch_markets.py) é pra exploração manual, não pro ciclo
+        # automatizado — virou 3.106 arquivos / 15 GB sozinho em
+        # outputs/reports sem isso.
+        assert '"pipeline/fetch_markets.py", "--no-report"' in self.SRC
+
+    def test_log_proprio_com_rotacao(self):
+        i_add = self.SRC.index("logger.add(")
+        body = self.SRC[i_add:i_add + 200]
+        assert 'rotation="1 day"' in body
+        assert 'retention="7 days"' in body

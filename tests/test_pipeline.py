@@ -392,6 +392,124 @@ class TestPipelineRun:
 
 
 # ===========================================================================
+# TestDbMaintenance — retenção (P2-37)
+# ===========================================================================
+
+class TestDbMaintenance:
+    """P2-37: outputs/reports e data/raw/markets nunca tinham retenção —
+    load_current_markets()/load_signals() só leem o arquivo mais recente de
+    cada padrão, então tudo mais velho é lixo puro. Chegou a 15 GB /
+    11.556 arquivos em outputs/reports."""
+
+    def _touch(self, path: Path, days_old: float):
+        path.write_text("x")
+        import os
+        old_ts = __import__("time").time() - days_old * 86400
+        os.utime(path, (old_ts, old_ts))
+
+    def test_prune_report_files_remove_so_padroes_conhecidos_e_antigos(self, tmp_path):
+        import db_maintenance
+        reports = tmp_path / "reports"
+        raw = tmp_path / "raw"
+        reports.mkdir()
+        raw.mkdir()
+
+        old_eda = reports / "eda_markets_20260101_000000.csv"
+        self._touch(old_eda, days_old=30)
+        new_eda = reports / "eda_markets_20260901_000000.csv"
+        self._touch(new_eda, days_old=1)
+        # Não está em REPORT_PATTERNS — não deve ser tocado mesmo sendo velho.
+        old_unrelated = reports / "notas_manuais.txt"
+        self._touch(old_unrelated, days_old=30)
+
+        old_resolved = raw / "resolved_markets_v2_20260401_000000.parquet"
+        self._touch(old_resolved, days_old=200)
+        old_snapshot = raw / "markets_all_20260101_000000.parquet"
+        self._touch(old_snapshot, days_old=30)
+
+        result = db_maintenance.prune_report_files(
+            reports_dir=reports, raw_markets_dir=raw, days=14, dry_run=False,
+        )
+
+        assert not old_eda.exists()
+        assert new_eda.exists()
+        assert old_unrelated.exists()      # padrão desconhecido — nunca apagado
+        assert old_resolved.exists()       # dataset do ml_lab — fora dos padrões, nunca apagado
+        assert not old_snapshot.exists()
+        assert result["files_removed"] == 2
+
+    def test_prune_report_files_dry_run_nao_apaga(self, tmp_path):
+        import db_maintenance
+        reports = tmp_path / "reports"
+        reports.mkdir()
+        old_eda = reports / "eda_markets_20260101_000000.csv"
+        self._touch(old_eda, days_old=30)
+
+        result = db_maintenance.prune_report_files(
+            reports_dir=reports, raw_markets_dir=tmp_path / "raw", days=14, dry_run=True,
+        )
+
+        assert old_eda.exists()
+        assert result["files_removed"] == 1
+        assert result["removed"] == [old_eda.name]
+
+    def test_prune_price_history_dry_run_nao_apaga_nem_faz_vacuum(self, tmp_path):
+        import db_maintenance
+        db = tmp_path / "paper.db"
+        conn = sqlite3.connect(db)
+        conn.execute("""
+            CREATE TABLE price_history (
+                condition_id TEXT, ts TEXT, best_bid REAL, best_ask REAL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO price_history VALUES ('0xa', datetime('now', '-30 days'), 0.4, 0.42)"
+        )
+        conn.execute(
+            "INSERT INTO price_history VALUES ('0xb', datetime('now'), 0.001, 0.999)"
+        )  # corrompido (spread > 0.5), mas recente
+        conn.commit()
+        conn.close()
+
+        result = db_maintenance.prune_price_history(days=14, db_path=db, dry_run=True)
+
+        conn = sqlite3.connect(db)
+        n = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+        conn.close()
+        assert n == 2  # nada removido
+        assert result["removed_old"] == 1
+        assert result["removed_corrupt"] == 1
+
+    def test_prune_price_history_apaga_antigas_e_corrompidas(self, tmp_path):
+        import db_maintenance
+        db = tmp_path / "paper.db"
+        conn = sqlite3.connect(db)
+        conn.execute("""
+            CREATE TABLE price_history (
+                condition_id TEXT, ts TEXT, best_bid REAL, best_ask REAL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO price_history VALUES ('0xa', datetime('now', '-30 days'), 0.4, 0.42)"
+        )
+        conn.execute(
+            "INSERT INTO price_history VALUES ('0xb', datetime('now'), 0.001, 0.999)"
+        )
+        conn.execute(
+            "INSERT INTO price_history VALUES ('0xc', datetime('now'), 0.40, 0.42)"
+        )  # recente e sã — sobrevive
+        conn.commit()
+        conn.close()
+
+        db_maintenance.prune_price_history(days=14, db_path=db, dry_run=False)
+
+        conn = sqlite3.connect(db)
+        rows = conn.execute("SELECT condition_id FROM price_history").fetchall()
+        conn.close()
+        assert [r[0] for r in rows] == ["0xc"]
+
+
+# ===========================================================================
 # TestIntegration — testes com a API real (requerem rede)
 # ===========================================================================
 
