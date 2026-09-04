@@ -20,8 +20,10 @@ Arb estrutural (independente do --mode): baskets GARANTIDOS do scanner
 todas as pernas na mesma transação, trade_type='arb', hold até resolução.
 """
 
+import contextlib
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -88,11 +90,23 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # P1-18: default do sqlite3 é 5s. Cinco processos disputam o mesmo
+    # arquivo (run_cycle, run_execution, ws_feed.exit_writer,
+    # ws_feed.history_writer commitando a 10Hz, dashboard) — 5s estoura fácil
+    # e sobe OperationalError sem nenhum try/except no meio do ciclo.
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
+# P1-18: WHERE id = ? com portfolio["id"] em cache já causou débito no
+# portfólio errado depois de reset (9 resets até agora) — o crédito
+# correspondente sempre vai pro portfólio ATUAL via get_or_create_portfolio().
+# Todo UPDATE portfolio usa este subquery em vez do id em Python.
+_CURRENT_PORTFOLIO_ID_SQL = "(SELECT MAX(id) FROM portfolio)"
+
+
 def init_db() -> None:
-    with get_connection() as conn:
+    with contextlib.closing(get_connection()) as conn:
         conn.executescript(SCHEMA)
         # Migrations: adiciona colunas ausentes sem recriar a tabela
         existing = {r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()}
@@ -116,7 +130,7 @@ def init_db() -> None:
 
 
 def get_or_create_portfolio(initial_capital: float = 1_000.0) -> dict:
-    with get_connection() as conn:
+    with contextlib.closing(get_connection()) as conn:
         row = conn.execute(
             "SELECT * FROM portfolio ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -135,7 +149,7 @@ def get_or_create_portfolio(initial_capital: float = 1_000.0) -> dict:
 
 
 def get_open_positions() -> pd.DataFrame:
-    with get_connection() as conn:
+    with contextlib.closing(get_connection()) as conn:
         rows = conn.execute(
             "SELECT * FROM positions WHERE status = 'open'"
         ).fetchall()
@@ -158,7 +172,7 @@ def get_traded_condition_ids() -> set[str]:
     (abertas + fechadas). Evita reabrir posições em mercados que já resolveram
     ou que foram encerrados por edge flip/profit target.
     """
-    with get_connection() as conn:
+    with contextlib.closing(get_connection()) as conn:
         portfolio_start = conn.execute(
             "SELECT created_at FROM portfolio ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -265,11 +279,20 @@ def open_position(
     portfolio: dict,
     signal: dict,
     dry_run: bool = False,
+    current_markets: pd.DataFrame | None = None,
+    open_positions: pd.DataFrame | None = None,
+    traded_ids: set[str] | None = None,
 ) -> dict | None:
     """
     Tenta abrir uma posição com base no sinal.
     Usa o risk_manager para sizing e verificação de limites.
     Retorna o dict da posição ou None se rejeitada.
+
+    P1-19: current_markets/open_positions/traded_ids são opcionais — quando o
+    chamador itera vários sinais no mesmo ciclo (run_paper_trading,
+    run_execution), passar os três evita reler o parquet e reconsultar o
+    banco a cada candidato. None (default) mantém o comportamento antigo,
+    buscando tudo internamente — é o que os testes existentes fazem.
     """
     sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
     from risk_manager import kelly_size, check_exposure, MIN_EDGE_ABS, normalize_trade_type
@@ -300,7 +323,7 @@ def open_position(
     # O sinal pode ter sido gerado há até 60min; re-cotamos para garantir
     # que o edge ainda existe com o preço corrente do mercado.
     MIN_EDGE = MIN_EDGE_ABS  # do risk_manager — não duplicar constantes
-    current_mkts = load_current_markets()
+    current_mkts = current_markets if current_markets is not None else load_current_markets()
     if cid and not current_mkts.empty:
         id_col = "conditionId" if "conditionId" in current_mkts.columns else "condition_id"
         match = current_mkts[current_mkts[id_col] == cid]
@@ -350,12 +373,16 @@ def open_position(
 
     cash = float(portfolio["current_cash"])
 
+    # P1-19: uma leitura só de open_positions pro candidato inteiro — antes
+    # eram duas (aqui e no check_exposure mais abaixo), cada uma um SELECT
+    # completo na tabela positions.
+    open_pos_snapshot = open_positions if open_positions is not None else get_open_positions()
+
     # Capital efetivo: caixa + 50% do valor MTM das posições abertas.
     # Posições abertas têm liquidez limitada mas não são zero — usar 50% como proxy.
     # Isso evita que o Kelly encolha progressivamente conforme alocamos capital.
-    open_pos_for_capital = get_open_positions()
-    if not open_pos_for_capital.empty and not current_mkts.empty:
-        mtm_tmp = mark_to_market(open_pos_for_capital, current_mkts)
+    if not open_pos_snapshot.empty and not current_mkts.empty:
+        mtm_tmp = mark_to_market(open_pos_snapshot, current_mkts)
         open_value = float(mtm_tmp["current_value"].sum()) if "current_value" in mtm_tmp.columns else 0.0
     else:
         open_value = 0.0
@@ -366,9 +393,9 @@ def open_position(
     # correlacionadas superaposta risco por ~√n.
     underlying = str(signal.get("underlying", "")).lower()
     n_correlated = 1
-    if underlying and not open_pos_for_capital.empty and "underlying" in open_pos_for_capital.columns:
+    if underlying and not open_pos_snapshot.empty and "underlying" in open_pos_snapshot.columns:
         n_correlated = 1 + int(
-            (open_pos_for_capital["underlying"].fillna("").str.lower() == underlying).sum()
+            (open_pos_snapshot["underlying"].fillna("").str.lower() == underlying).sum()
         )
 
     # Kelly com confidence modulation — sizing varia por trade_type
@@ -408,20 +435,20 @@ def open_position(
         return None
 
     # Não reabrir mercados já operados neste portfólio (evita loop em mercados resolvidos)
-    if cid and cid in get_traded_condition_ids():
+    traded = traded_ids if traded_ids is not None else get_traded_condition_ids()
+    if cid and cid in traded:
         logger.debug(f"REJEITADO [já_operado] {cid[:16]}")
         return None
 
     # Verificações de diversificação — P1-11b: denominador é cash + MTM
     # (total_value), não initial_capital, senão os caps folgam depois de um
     # drawdown em vez de apertar.
-    open_pos = get_open_positions()
     total_value = cash + open_value
     # P1-16: check_exposure exclui posição travada (needs_manual_resolution=1)
     # só do contador de slot direcional — passa a lista completa aqui de
     # propósito, pra manter a checagem de duplicata e os caps de
     # categoria/underlying vendo o capital que continua comprometido nela.
-    can_trade, reason = check_exposure(signal, open_pos, portfolio, size_usdc, total_value=total_value)
+    can_trade, reason = check_exposure(signal, open_pos_snapshot, portfolio, size_usdc, total_value=total_value)
     if not can_trade:
         logger.info(f"REJEITADO [risco: {reason}] {_q}")
         return None
@@ -449,52 +476,63 @@ def open_position(
     if dry_run:
         return position
 
-    with get_connection() as conn:
-        # Migração automática de colunas novas
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()}
-        if "trade_type" not in cols:
-            conn.execute("ALTER TABLE positions ADD COLUMN trade_type TEXT DEFAULT 'value'")
-        if "event_slug" not in cols:
-            conn.execute("ALTER TABLE positions ADD COLUMN event_slug TEXT DEFAULT ''")
-        if "underlying" not in cols:
-            conn.execute("ALTER TABLE positions ADD COLUMN underlying TEXT DEFAULT ''")
-
-        conn.execute("""
-            INSERT INTO positions
-              (condition_id, question, category, underlying, signal_source, trade_type, direction,
-               entry_price, shares, cost_usdc, edge_at_entry, prob_at_entry,
-               confidence, end_date, event_slug)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            position["condition_id"], position["question"], position["category"],
-            position["underlying"], position["signal_source"], position["trade_type"],
-            position["direction"], position["entry_price"], position["shares"],
-            position["cost_usdc"], position["edge_at_entry"], position["prob_at_entry"],
-            position["confidence"], position["end_date"], position["event_slug"],
-        ))
-        cur = conn.execute(
-            "UPDATE portfolio SET current_cash = current_cash - ? "
-            "WHERE id = ? AND current_cash >= ?",
-            (size_usdc, portfolio["id"], size_usdc),
-        )
-        if cur.rowcount == 0:
-            logger.warning(
-                f"Race condition: caixa insuficiente para ${size_usdc:.2f} "
-                f"— posição cancelada (outro processo abriu posição simultaneamente?)"
+    # P1-18: única gravação de dinheiro sem BEGIN IMMEDIATE/retry até aqui —
+    # com o history_writer do ws_feed commitando a 10Hz, um open_position
+    # azarado estourava o busy_timeout e a OperationalError subia sem
+    # try/except, matando o subprocesso no meio do ciclo. ALTER TABLE saiu
+    # daqui — já é feito uma vez por init_db(), redundante dentro da
+    # transação de dinheiro. Ordem cash-primeiro-com-guarda, posição depois,
+    # igual open_basket/rebalance_positions.
+    MAX_DB_RETRIES = 3
+    for attempt in range(1, MAX_DB_RETRIES + 1):
+        try:
+            with contextlib.closing(get_connection()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    "UPDATE portfolio SET current_cash = current_cash - ? "
+                    f"WHERE id = {_CURRENT_PORTFOLIO_ID_SQL} AND current_cash >= ?",
+                    (size_usdc, size_usdc),
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    logger.warning(
+                        f"Race condition: caixa insuficiente para ${size_usdc:.2f} "
+                        f"— posição cancelada (outro processo abriu posição simultaneamente?)"
+                    )
+                    return None
+                conn.execute("""
+                    INSERT INTO positions
+                      (condition_id, question, category, underlying, signal_source, trade_type, direction,
+                       entry_price, shares, cost_usdc, edge_at_entry, prob_at_entry,
+                       confidence, end_date, event_slug)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    position["condition_id"], position["question"], position["category"],
+                    position["underlying"], position["signal_source"], position["trade_type"],
+                    position["direction"], position["entry_price"], position["shares"],
+                    position["cost_usdc"], position["edge_at_entry"], position["prob_at_entry"],
+                    position["confidence"], position["end_date"], position["event_slug"],
+                ))
+                conn.execute("""
+                    INSERT INTO trades_log (action, condition_id, direction, price, shares, usdc_amount, note)
+                    VALUES ('OPEN', ?, ?, ?, ?, ?, ?)
+                """, (
+                    position["condition_id"], direction, position["entry_price"],
+                    position["shares"], position["cost_usdc"],
+                    f"source={signal_source} edge={edge:.3f} conf={confidence:.2f}",
+                ))
+                conn.commit()
+            return position
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < MAX_DB_RETRIES:
+                logger.warning(f"DB travado ao abrir posição, tentativa {attempt}/{MAX_DB_RETRIES}: {e}")
+                time.sleep(0.5 * attempt)
+                continue
+            logger.exception(
+                f"open_position falhou após {attempt} tentativa(s) — sinal descartado, "
+                "ciclo continua"
             )
-            conn.rollback()
             return None
-        conn.execute("""
-            INSERT INTO trades_log (action, condition_id, direction, price, shares, usdc_amount, note)
-            VALUES ('OPEN', ?, ?, ?, ?, ?, ?)
-        """, (
-            position["condition_id"], direction, position["entry_price"],
-            position["shares"], position["cost_usdc"],
-            f"source={signal_source} edge={edge:.3f} conf={confidence:.2f}",
-        ))
-        conn.commit()
-
-    return position
 
 
 # ──────────────────────────────────────────────────────────
@@ -671,7 +709,7 @@ def open_basket(
         return summary
 
     # ── Abertura ATÔMICA: débito único + todas as pernas na mesma transação ──
-    with get_connection() as conn:
+    with contextlib.closing(get_connection()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
             cur = conn.execute(
@@ -925,7 +963,7 @@ def rebalance_positions(
         )
 
         if not dry_run:
-            with get_connection() as conn:
+            with contextlib.closing(get_connection()) as conn:
                 # Ordem importa: debita o cash PRIMEIRO (com guard) e só então
                 # aumenta a posição. Antes, se o guard de cash falhasse, a posição
                 # ficava com shares/custo aumentados sem o débito correspondente.
@@ -1220,11 +1258,26 @@ def run_paper_trading(
         console.print(f"  Sinais disponíveis: {len(signals_top)} | Posições: {n_open}/{max_positions} | Caixa: ${cash:,.2f}\n")
 
         # ── 6. Abre posições ────────────────────────────
+        # P1-19: current_markets/traded_ids/open_pos içados pro chamador —
+        # sem isso, open_position relia o parquet inteiro e reconsultava o
+        # banco a cada candidato (até 30 leituras de parquet por ciclo).
+        # open_pos e traded_ids são atualizados aqui a cada abertura pra não
+        # perder o efeito de uma posição aberta 2 candidatos atrás nesse
+        # mesmo ciclo (caps de diversificação, checagem de duplicata). A
+        # linha apendada em open_pos não tem "id" (só existe depois do
+        # INSERT) — serve só pra leitura de caps/duplicata neste loop, não
+        # pra um caminho de escrita (mark_to_market/early_exit/resolve
+        # precisam do id de verdade e rodam com open_pos recarregado do
+        # banco no próximo passo do ciclo, não com este).
+        traded_ids = get_traded_condition_ids()
         opened = skipped = 0
         for _, sig in signals_top.iterrows():
             if slots <= 0 or cash < 5:
                 break
-            pos = open_position(portfolio, sig.to_dict(), dry_run=dry_run)
+            pos = open_position(
+                portfolio, sig.to_dict(), dry_run=dry_run,
+                current_markets=current_markets, open_positions=open_pos, traded_ids=traded_ids,
+            )
             if pos:
                 dir_c = "green" if pos["direction"] == "BUY_YES" else "magenta"
                 console.print(
@@ -1236,6 +1289,12 @@ def run_paper_trading(
                 slots  -= 1
                 cash   -= pos["cost_usdc"]
                 portfolio["current_cash"] = cash
+                if not dry_run:
+                    traded_ids.add(str(pos["condition_id"]))
+                    open_pos = pd.concat(
+                        [open_pos, pd.DataFrame([{**pos, "status": "open", "needs_manual_resolution": 0}])],
+                        ignore_index=True,
+                    )
             else:
                 skipped += 1
 
@@ -1251,7 +1310,7 @@ def run_paper_trading(
     else:
         positions_mtm = open_pos if not open_pos.empty else pd.DataFrame()
 
-    with get_connection() as conn:
+    with contextlib.closing(get_connection()) as conn:
         row = conn.execute("SELECT * FROM portfolio ORDER BY id DESC LIMIT 1").fetchone()
         portfolio = dict(row)
 

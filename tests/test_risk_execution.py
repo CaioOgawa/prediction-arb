@@ -2532,3 +2532,239 @@ class TestSignalGeneratorUsaEdgeDeVerdade:
         )
         assert not signals.empty
         assert (signals["trade_type"] == "value").all()
+
+
+def _valid_open_signal(condition_id="0xnovo"):
+    return {
+        "condition_id": condition_id, "question": "Teste?", "underlying": "",
+        "direction": "BUY_YES", "yes_price": 0.50, "edge": 0.15, "prob_yes": 0.65,
+        "confidence": 1.0, "signal_source": "odds", "trade_type": "value",
+        "spread": 0.06, "liquidity": 0.0,
+    }
+
+
+class TestOpenPositionDebitaOPortfolioAtual:
+    """P1-18: open_position mirava WHERE id = ? com portfolio["id"] em cache
+    — já houve 9 resets em produção; depois de um, o débito ia pro portfólio
+    aposentado e o crédito de fechamentos futuros caía no portfólio novo,
+    perdendo dinheiro silenciosamente. A correção usa
+    WHERE id = (SELECT MAX(id) FROM portfolio), igual open_basket/
+    rebalance_positions/resolve_positions já faziam."""
+
+    def test_debita_do_portfolio_mais_novo_nao_do_id_em_cache(self, tmp_path, monkeypatch):
+        db = tmp_path / "paper.db"
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+        paper_trader.init_db()
+
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO portfolio (id, initial_capital, current_cash) VALUES (1, 1000, 1000)")
+        # Simula um reset: portfólio novo, id maior, cash menor.
+        conn.execute("INSERT INTO portfolio (id, initial_capital, current_cash) VALUES (2, 500, 500)")
+        conn.commit()
+        conn.close()
+
+        # portfolio["id"]=1 é a referência EM CACHE (stale) que um chamador de
+        # vida longa carregaria de antes do reset — current_cash reflete o
+        # portfólio 2 real, como get_or_create_portfolio() devolveria hoje.
+        stale_portfolio = {"id": 1, "current_cash": 500.0}
+        pos = paper_trader.open_position(stale_portfolio, _valid_open_signal(), dry_run=False)
+
+        assert pos is not None
+        conn = sqlite3.connect(db)
+        cash_id1 = conn.execute("SELECT current_cash FROM portfolio WHERE id=1").fetchone()[0]
+        cash_id2 = conn.execute("SELECT current_cash FROM portfolio WHERE id=2").fetchone()[0]
+        conn.close()
+        assert cash_id1 == 1000.0  # portfólio aposentado intocado
+        assert cash_id2 == pytest.approx(500.0 - pos["cost_usdc"])  # débito no atual
+
+
+class TestOpenPositionBeginImmediateERetry:
+    """P1-18: única gravação de dinheiro sem BEGIN IMMEDIATE/retry — um
+    OperationalError('database is locked') subia sem try/except e matava o
+    subprocesso no meio do ciclo."""
+
+    SRC = (ROOT / "execution" / "paper_trader.py").read_text()
+
+    def test_open_position_usa_begin_immediate(self):
+        i_def = self.SRC.index("def open_position(")
+        i_next_def = self.SRC.index("\ndef ", i_def + 1)
+        body = self.SRC[i_def:i_next_def]
+        assert "BEGIN IMMEDIATE" in body
+        assert "ADD COLUMN" not in body  # P1-18: ALTER TABLE saiu da transação de dinheiro
+
+    def test_get_connection_seta_busy_timeout(self):
+        assert "PRAGMA busy_timeout" in self.SRC
+
+    def test_retry_em_database_locked(self, tmp_path, monkeypatch):
+        db = tmp_path / "paper.db"
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+        paper_trader.init_db()
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO portfolio (initial_capital, current_cash) VALUES (1000, 1000)")
+        conn.commit()
+        conn.close()
+
+        class _FlakyConn:
+            """Proxy que falha o BEGIN IMMEDIATE uma vez só, depois se comporta normal.
+            sqlite3.Connection não aceita sobrescrever .execute na instância
+            (atributo read-only do tipo C), daí o proxy em vez de monkeypatch direto."""
+            def __init__(self, real):
+                object.__setattr__(self, "_real", real)
+                object.__setattr__(self, "_armed", True)
+
+            def execute(self, sql, *a, **kw):
+                if object.__getattribute__(self, "_armed") and sql.strip() == "BEGIN IMMEDIATE":
+                    object.__setattr__(self, "_armed", False)
+                    raise sqlite3.OperationalError("database is locked")
+                return self._real.execute(sql, *a, **kw)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def __setattr__(self, name, value):
+                setattr(self._real, name, value)
+
+        state = {"n": 0, "flaky": None}
+        real_get_connection = paper_trader.get_connection
+
+        def flaky_get_connection():
+            state["n"] += 1
+            real_conn = real_get_connection()
+            if state["n"] == 1:
+                state["flaky"] = _FlakyConn(real_conn)
+                return state["flaky"]
+            return real_conn
+
+        monkeypatch.setattr(paper_trader, "get_connection", flaky_get_connection)
+        monkeypatch.setattr(paper_trader.time, "sleep", lambda *_: None)  # não espera de verdade
+
+        pos = paper_trader.open_position(
+            {"current_cash": 1000.0}, _valid_open_signal(), dry_run=False,
+            current_markets=pd.DataFrame(), open_positions=pd.DataFrame(), traded_ids=set(),
+        )
+
+        assert pos is not None  # segunda tentativa vingou
+        assert state["n"] == 2
+
+
+class TestOpenPositionRecebeSnapshotsDoChamador:
+    """P1-19: por candidato a sinal, open_position relia o parquet inteiro
+    (load_current_markets) e reconsultava o banco (get_open_positions,
+    get_traded_condition_ids) — até 30 leituras de parquet por ciclo com
+    top_signals=30, ilimitado no run_execution. Os três agora são opcionais:
+    quando o chamador passa, open_position usa o que foi passado sem tocar
+    disco/banco de novo."""
+
+    def test_nao_chama_load_current_markets_quando_current_markets_passado(self, tmp_path, monkeypatch):
+        db = tmp_path / "paper.db"
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+        paper_trader.init_db()
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO portfolio (initial_capital, current_cash) VALUES (1000, 1000)")
+        conn.commit()
+        conn.close()
+
+        def boom():
+            raise AssertionError("load_current_markets não deveria ser chamado")
+        monkeypatch.setattr(paper_trader, "load_current_markets", boom)
+
+        pos = paper_trader.open_position(
+            {"current_cash": 1000.0}, _valid_open_signal(), dry_run=True,
+            current_markets=pd.DataFrame(), open_positions=pd.DataFrame(), traded_ids=set(),
+        )
+        assert pos is not None
+
+    def test_nao_chama_get_open_positions_nem_get_traded_ids_quando_passados(self, tmp_path, monkeypatch):
+        db = tmp_path / "paper.db"
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+        paper_trader.init_db()
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO portfolio (initial_capital, current_cash) VALUES (1000, 1000)")
+        conn.commit()
+        conn.close()
+
+        def boom(*a, **kw):
+            raise AssertionError("não deveria reconsultar o banco — snapshot já foi passado")
+        monkeypatch.setattr(paper_trader, "get_open_positions", boom)
+        monkeypatch.setattr(paper_trader, "get_traded_condition_ids", boom)
+
+        pos = paper_trader.open_position(
+            {"current_cash": 1000.0}, _valid_open_signal(), dry_run=True,
+            current_markets=pd.DataFrame(), open_positions=pd.DataFrame(), traded_ids=set(),
+        )
+        assert pos is not None
+
+    def test_traded_ids_passado_ainda_bloqueia_duplicata(self, tmp_path, monkeypatch):
+        db = tmp_path / "paper.db"
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+        paper_trader.init_db()
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO portfolio (initial_capital, current_cash) VALUES (1000, 1000)")
+        conn.commit()
+        conn.close()
+
+        pos = paper_trader.open_position(
+            {"current_cash": 1000.0}, _valid_open_signal("0xjatem"), dry_run=True,
+            current_markets=pd.DataFrame(), open_positions=pd.DataFrame(),
+            traded_ids={"0xjatem"},
+        )
+        assert pos is None
+
+    def test_linha_apendada_no_loop_do_chamador_tem_status_open(self):
+        # Achado na revisão do advisor: pd.concat com um dict de 15 chaves
+        # (o que open_position devolve) contra open_pos (SELECT * — 20+
+        # colunas, incluindo status) sem "status" no dict apendado deixava
+        # NaN em status pra essa linha — a mesma classe de bug do P1-17
+        # (str(nan)=='nan' furando .get/comparação rio abaixo). Smoke test
+        # de código-fonte: os dois pontos onde o loop apenda a posição
+        # recém-aberta precisam fixar status="open" explicitamente.
+        for path, marker in [
+            (ROOT / "execution" / "paper_trader.py", '{**pos, "status": "open"'),
+            (ROOT / "run_execution.py", '{**result, "status": "open"'),
+        ]:
+            assert marker in path.read_text(), f"{path.name} sem status fixo na linha apendada"
+
+
+class TestRunCycleTimeoutELock:
+    """P1-20: subprocess.run sem timeout= deixava uma chamada de rede
+    pendurada travar o ciclo indefinidamente, e o StartInterval fixo do
+    launchd empilhava ciclos sobrepostos em cima do subprocesso travado —
+    o mesmo cenário contra o qual P1-18 protege no lado do banco. Teste de
+    fumaça sobre o código-fonte (main() tem efeitos colaterais de processo
+    — chdir, flock, subprocess — pesados demais pra rodar ponta a ponta)."""
+
+    SRC = (ROOT / "run_cycle.py").read_text()
+
+    def test_subprocess_run_tem_timeout(self):
+        i_run = self.SRC.index("def run(cmd")
+        i_next_def = self.SRC.index("\ndef ", i_run + 1)
+        body = self.SRC[i_run:i_next_def]
+        assert "timeout=timeout" in body
+        assert "TimeoutExpired" in body
+
+    def test_usa_flock_nao_bloqueante(self):
+        assert "fcntl.flock" in self.SRC
+        assert "LOCK_EX | fcntl.LOCK_NB" in self.SRC
+
+    def test_fetch_markets_falho_nao_aborta_o_resto_do_ciclo(self):
+        # P1-20 cogitou abortar o ciclo inteiro numa falha de fetch_markets.
+        # Revertido: logs/cycle_light_error.log mostra ~27% de falha
+        # histórica (Gamma API/DNS piscando por segundos), e P0-6/P0-2 já
+        # fecham o buraco de dado sem precisar de abort — abortar custaria
+        # 1/4 dos ciclos de trading pra pouco ganho. Fica soft, sinais/
+        # paper_trader seguem rodando (e degradam pra no-op sozinhos se o
+        # snapshot ficar velho demais).
+        i_fetch = self.SRC.index('run(uv + ["pipeline/fetch_markets.py"]')
+        i_odds_step = self.SRC.index("# ── 2. Sinais odds")
+        assert i_fetch < i_odds_step
+        body_between = self.SRC[i_fetch:i_odds_step]
+        assert "critical" not in body_between.lower()
+        assert "return" not in body_between  # não sai da função nem pula passos
+
+    def test_db_maintenance_pulado_em_dry_run(self):
+        i_step7 = self.SRC.index("Retenção do price_history")
+        body = self.SRC[i_step7:i_step7 + 400]
+        assert "if dry_run:" in body
+
+    def test_chdir_pro_diretorio_do_script(self):
+        assert "os.chdir(Path(__file__).resolve().parent)" in self.SRC

@@ -67,6 +67,7 @@ def main(dry_run: bool, mode: str) -> None:
         init_db,
         get_or_create_portfolio,
         get_open_positions,
+        get_traded_condition_ids,
         load_current_markets,
         load_signals,
         mark_to_market,
@@ -194,13 +195,26 @@ def main(dry_run: bool, mode: str) -> None:
         n_open = int((open_pos["trade_type"].fillna("value") != "arb").sum())
     slots = max(0, MAX_OPEN_POSITIONS - n_open)
 
+    # P1-19: içados pro chamador uma vez por ciclo, em vez de open_position
+    # reler o parquet e reconsultar o banco a cada sinal candidato — este
+    # daemon roda sem cap de sinais nenhum, então era ilimitado. Atualizados
+    # a cada abertura pra não perder o efeito de uma posição aberta 2
+    # candidatos atrás no mesmo ciclo (caps de diversificação, duplicata).
+    # A linha apendada em open_pos não tem "id" (só existe depois do
+    # INSERT) — serve só pra leitura de caps/duplicata neste loop; o passo
+    # 5 abaixo recarrega open_pos do banco antes do mark_to_market.
+    traded_ids = get_traded_condition_ids()
+
     n_opened = 0
     if not signals_top.empty:
         logger.info(f"Sinais disponíveis: {len(signals_top)} (de {len(signals)} pós-liquidez) | slots: {slots}")
         for _, sig in signals_top.iterrows():
             if slots <= 0 or float(portfolio["current_cash"]) < 5:
                 break
-            result = open_position(portfolio, sig.to_dict(), dry_run=dry_run)
+            result = open_position(
+                portfolio, sig.to_dict(), dry_run=dry_run,
+                current_markets=current_mkts, open_positions=open_pos, traded_ids=traded_ids,
+            )
             if result:
                 n_opened += 1
                 slots -= 1
@@ -209,6 +223,12 @@ def main(dry_run: bool, mode: str) -> None:
                     f"{result['direction']} ${result['cost_usdc']:.2f} "
                     f"@ {result['entry_price']:.3f}"
                 )
+                if not dry_run:
+                    traded_ids.add(str(result["condition_id"]))
+                    open_pos = pd.concat(
+                        [open_pos, pd.DataFrame([{**result, "status": "open", "needs_manual_resolution": 0}])],
+                        ignore_index=True,
+                    )
                 # Atualiza portfolio para próxima iteração (cash decrementado)
                 portfolio = get_or_create_portfolio()
         if n_opened == 0:
