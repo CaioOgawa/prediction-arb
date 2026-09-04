@@ -156,16 +156,31 @@ def get_traded_condition_ids() -> set[str]:
     return {r[0] for r in rows} if rows else set()
 
 
+MAX_MARKET_SNAPSHOT_AGE_MIN = 90
+
+
 def load_current_markets() -> pd.DataFrame:
     """Carrega snapshot mais recente de mercados para mark-to-market e resolução."""
     candidates = sorted(
         list(RAW_MKT_DIR.glob("markets_all_*.parquet")) +
         list(RAW_MKT_DIR.glob("markets_incremental_*.parquet")),
+        key=lambda p: p.stat().st_mtime,  # ordena por tempo de modificação, não por nome
         reverse=True,
     )
     if not candidates:
         return pd.DataFrame()
-    return pd.read_parquet(candidates[0])
+
+    newest = candidates[0]
+    age_min = int((datetime.now().timestamp() - newest.stat().st_mtime) // 60)
+    if age_min > MAX_MARKET_SNAPSHOT_AGE_MIN:
+        logger.warning(
+            f"Snapshot de mercados STALE ({newest.name}, {age_min}min > "
+            f"{MAX_MARKET_SNAPSHOT_AGE_MIN}min) — ignorado. Execute o pipeline "
+            "para gerar mercados frescos."
+        )
+        return pd.DataFrame()
+
+    return pd.read_parquet(newest)
 
 
 def load_signals(mode: str = "odds", min_edge: float | None = None) -> pd.DataFrame:

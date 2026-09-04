@@ -63,6 +63,37 @@ def check_degradation(full: bool) -> list[str]:
     except Exception as e:
         problems.append(f"falha ao checar universo: {e}")
 
+    # 1b. Snapshot que o paper trader efetivamente carregaria (P0-2: seleção
+    #     por nome escolhia markets_incremental_* velho em vez do mais recente)
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from execution.paper_trader import load_current_markets, RAW_MKT_DIR
+
+        selected = sorted(
+            list(RAW_MKT_DIR.glob("markets_all_*.parquet")) +
+            list(RAW_MKT_DIR.glob("markets_incremental_*.parquet")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not selected:
+            problems.append("load_current_markets(): nenhum candidato de snapshot encontrado")
+        else:
+            newest = selected[0]
+            age_min = (now_ts - newest.stat().st_mtime) / 60
+            current = load_current_markets()
+            if current.empty:
+                problems.append(
+                    f"load_current_markets() vazio — {newest.name} tem {age_min:.0f}min "
+                    "(stale ou sem linhas)"
+                )
+            else:
+                logger.debug(
+                    f"snapshot efetivo do paper trader: {newest.name} "
+                    f"({age_min:.0f}min, {len(current)} mercados)"
+                )
+    except Exception as e:
+        problems.append(f"falha ao checar snapshot do paper trader: {e}")
+
     # 2. Sinais deribit sem atualização há mais de 24h (gerados a cada ciclo light)
     try:
         sigs = sorted(Path("outputs/reports").glob("signals_deribit_*.csv"),
