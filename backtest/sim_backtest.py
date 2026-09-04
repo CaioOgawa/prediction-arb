@@ -72,7 +72,7 @@ from deribit_collector import (
 from risk_manager import (
     EARLY_EXIT as _EARLY_EXIT,
     KELLY_MAX_FRAC,
-    MAX_POSITION_PCT as _MAX_POSITION_PCT,
+    kelly_size as _kelly_size_shared,
 )
 
 RESULTS_DIR   = Path("backtest/results")
@@ -83,8 +83,6 @@ PROFIT_TARGET_VALUE    = float(_EARLY_EXIT["value"]["profit_target_mult"])      
 PROFIT_TARGET_MOMENTUM = float(_EARLY_EXIT["momentum"]["profit_target_mult"])   # 1.5
 EDGE_FLIP_DELTA        = float(_EARLY_EXIT["value"]["edge_flip_delta"])         # 0.25 (era 0.10 duplicado)
 KELLY_FRACTION         = KELLY_MAX_FRAC                                          # 0.25
-MIN_POSITION_SIZE      = 2.0   # USDC
-MAX_POSITION_PCT       = float(_MAX_POSITION_PCT["value"])                       # 3% (era 10% duplicado)
 
 
 # ──────────────────────────────────────────────────────────
@@ -373,24 +371,28 @@ class WalkForwardSimulator:
 
     def _kelly_size(self, entry_price: float, prob: float) -> float:
         """
-        Kelly fraction para opção binária.
-        p = probabilidade de win (≈ convicção do modelo)
-        b = payoff líquido (odds) = 1/entry_price - 1
-        Kelly = (p*b - (1-p)) / b
+        P2-33: delega para risk_manager.kelly_size — a mesma função que a
+        produção usa. A versão anterior reimplementava a fórmula aqui (de
+        forma correta, ao contrário da produção pré-P1-9) e mais nada do
+        resto do stack de risco (MIN_EDGE_TO_TRADE, MIN_CONFIDENCE) — dois
+        caminhos que podiam divergir silenciosamente no arquivo que promete
+        paridade com produção no cabeçalho.
+
+        prob é a probabilidade de win do lado comprado (fair_price no call
+        site); edge = prob - entry_price segue a mesma convenção do
+        kelly_size. self.kelly_fraction fica sem efeito aqui — kelly_size já
+        aplica KELLY_MAX_FRAC internamente, e nada no CLI expõe um
+        --kelly-fraction que precise de override por instância.
         """
-        b = (1.0 / entry_price) - 1.0
-        if b <= 0:
-            return 0.0
-        kelly = (prob * b - (1 - prob)) / b
-        kelly = max(0.0, kelly)
-
-        effective_cash = self.cash
-        size = self.kelly_fraction * kelly * effective_cash
-        max_size = effective_cash * MAX_POSITION_PCT
-
-        if size < MIN_POSITION_SIZE:
-            return 0.0
-        return min(size, max_size)
+        edge = prob - entry_price
+        return _kelly_size_shared(
+            edge=edge,
+            entry_price=entry_price,
+            capital=self.cash,
+            confidence=1.0,
+            signal_source="deribit",
+            trade_type="value",
+        )
 
     def _check_touch_resolution(
         self, pos: SimPosition, ts: datetime

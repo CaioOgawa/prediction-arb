@@ -17,6 +17,7 @@ import ast
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -645,6 +646,97 @@ class TestKelly:
             signal_source="odds", trade_type="value",
         )
         assert 0 < size <= 1000 * risk_manager.MAX_POSITION_PCT["value"] + 0.01
+
+    def test_formula_bate_com_a_tabela_da_auditoria(self):
+        # p=0.20, edge=0.10 -> f*=edge/(1-p)=0.125 (a fórmula antiga dava
+        # edge*p/(1-p)=0.025, 5x menor). kelly_full clampa em KELLY_FULL_CAP
+        # (0.10) antes do quarter-Kelly: 0.10*0.25*1.0=0.025 -> $25 em $1000.
+        size = risk_manager.kelly_size(
+            edge=0.10, entry_price=0.20, capital=1000, confidence=1.0,
+            signal_source="odds", trade_type="value",
+        )
+        assert size == 25.0
+
+    def test_formula_sem_clamp_bate_com_edge_sobre_1_menos_p(self):
+        # p=0.10, edge=0.08: kelly_full=0.08/0.90=0.0889 (< KELLY_FULL_CAP,
+        # não clampa) -> kelly_used=0.0889*0.25=0.02222 (< pos_pct 'value'
+        # 0.03, não clampa) -> $22.22 em $1000. Isola a fórmula pura.
+        size = risk_manager.kelly_size(
+            edge=0.08, entry_price=0.10, capital=1000, confidence=1.0,
+            signal_source="odds", trade_type="value",
+        )
+        assert abs(size - 22.22) < 0.01
+
+    def test_clamp_do_kelly_full_binda_em_preco_alto_nao_baixo(self):
+        # P1-10: o clamp existe para p ALTO (token quase certo), onde
+        # (1-p)->0 faz f* explodir — não para p baixo (deep-OTM), onde
+        # f*=edge/(1-p) fica pequeno e limitado por construção. As duas
+        # posições NÃO podem dar o mesmo tamanho: se o clamp estivesse do
+        # lado errado (ou a fórmula tivesse regredido para edge*p/(1-p)),
+        # esses dois valores não bateriam.
+        edge = 0.08
+
+        # p baixo (0.05): kelly_full=0.08/0.95=0.0842 (< KELLY_FULL_CAP, não
+        # clampa) -> kelly_used=0.0842*0.25=0.02105 (< pos_pct 0.03) -> $21.05
+        size_low_p = risk_manager.kelly_size(
+            edge=edge, entry_price=0.05, capital=1000, confidence=1.0,
+            signal_source="odds", trade_type="value",
+        )
+        assert size_low_p == 21.05
+
+        # p alto (0.95): kelly_full=0.08/0.05=1.6 >> KELLY_FULL_CAP -> clampa
+        # em 0.10 -> kelly_used=0.10*0.25=0.025 (< pos_pct 0.03) -> $25.00,
+        # travado no KELLY_FULL_CAP e não na fórmula bruta.
+        size_high_p = risk_manager.kelly_size(
+            edge=edge, entry_price=0.95, capital=1000, confidence=1.0,
+            signal_source="odds", trade_type="value",
+        )
+        assert size_high_p == 25.0
+
+
+# ──────────────────────────────────────────────────────────
+# sim_backtest — paridade de Kelly com produção (P2-33)
+# ──────────────────────────────────────────────────────────
+
+sys.path.insert(0, str(ROOT / "backtest"))
+import sim_backtest
+
+
+class TestSimBacktestKellyParity:
+    """
+    P2-33: sim_backtest tinha sua própria _kelly_size — com a fórmula CORRETA
+    (ao contrário da produção pré-P1-9), mas isolada. O cabeçalho do arquivo
+    afirma paridade com produção; só passou a ser verdade quando as duas
+    funções viraram a mesma função. Testa que o simulador não pode mais
+    divergir silenciosamente da produção.
+    """
+
+    def _sim(self, capital=1000.0):
+        return sim_backtest.WalkForwardSimulator(
+            sim_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            sim_end=datetime(2026, 2, 1, tzinfo=timezone.utc),
+            initial_capital=capital,
+        )
+
+    @pytest.mark.parametrize("entry_price,prob", [
+        (0.20, 0.30),   # exemplo da auditoria: edge=0.10
+        (0.10, 0.18),   # edge=0.08, sem clamp de KELLY_FULL_CAP
+        (0.50, 0.65),   # edge=0.15, meio da distribuição
+    ])
+    def test_bate_exatamente_com_risk_manager_kelly_size(self, entry_price, prob):
+        sim = self._sim()
+        edge = prob - entry_price
+        expected = risk_manager.kelly_size(
+            edge=edge, entry_price=entry_price, capital=sim.cash,
+            confidence=1.0, signal_source="deribit", trade_type="value",
+        )
+        assert sim._kelly_size(entry_price, prob) == expected
+
+    def test_edge_abaixo_do_minimo_deribit_da_zero(self):
+        # MIN_EDGE_TO_TRADE["deribit"]=0.05 — o simulador agora herda esse
+        # piso, que antes não existia aqui (P2-33 nota isso como lacuna).
+        sim = self._sim()
+        assert sim._kelly_size(entry_price=0.50, prob=0.53) == 0.0  # edge=0.03
 
 
 # ──────────────────────────────────────────────────────────

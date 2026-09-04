@@ -35,6 +35,12 @@ MIN_EDGE_TO_TRADE = {
 }
 KELLY_MAX_FRAC    = 0.25   # Quarter-Kelly — reduz variância mantendo EV
 
+# Full Kelly (pré-KELLY_MAX_FRAC) explode conforme entry_price → 1 — um token
+# quase certo (0.90+) com edge modesto ainda dá full-Kelly gigante, porque o
+# denominador (1 - entry_price) some. Cap absoluto na fração cheia antes de
+# aplicar KELLY_MAX_FRAC/confidence. Ver kelly_size() para a derivação.
+KELLY_FULL_CAP    = 0.10
+
 # Piso absoluto de edge usado como pré-filtro coarse (load_signals e re-cotação
 # do paper_trader). O gate fino por fonte é MIN_EDGE_TO_TRADE, aplicado no kelly_size.
 MIN_EDGE_ABS      = 0.03
@@ -143,14 +149,21 @@ def kelly_size(
     """
     Calcula o tamanho da posição em USDC via Kelly fracionado.
 
-    Fórmula para mercado binário (aposta num token de prediction market):
-        f* = edge / (ganho_por_unidade)
-           = edge / ((1 / entry_price) - 1)
-           = edge * entry_price / (1 - entry_price)
+    Fórmula para mercado binário (aposta num token de prediction market a
+    preço p, com probabilidade real estimada q, edge = q - p):
+        b  = payoff líquido por unidade apostada se ganhar = (1/p) - 1 = (1-p)/p
+        f* = (q·b - (1-q)) / b = (q-p) / (1-p) = edge / (1 - entry_price)
 
-    O edge aqui é a diferença entre a probabilidade real estimada e o preço
-    pago pelo token. Exemplo: se o token YES custa 0.40 e a fair prob é 0.55,
-    edge = 0.15 e o ganho por unidade = (1/0.40) - 1 = 1.5x.
+    P1-9: a versão anterior calculava `edge / b`, que simplifica para
+    `edge · p / (1-p)` — o valor correto multiplicado por `p`. Confundia
+    "edge" (diferença de probabilidade) com "edge por unidade apostada"
+    (edge/p). Subdimensionava 2× a p=0.50, 5× a p=0.20, 25× a p=0.04 — e como
+    o clamp/hard-cap seguintes nunca chegavam a atuar sobre um Kelly sempre
+    pequeno demais, a maior posição não-arb do livro real era 1.4% do capital
+    contra um MAX_POSITION_PCT de 3%.
+
+    Exemplo: token YES a 0.40, fair prob 0.55 → edge=0.15, f*=0.15/0.60=0.25
+    (antes: 0.15/1.5=0.10 — 2.5× menor que o correto).
 
     Ajustes conservadores:
       - Multiplica pelo KELLY_MAX_FRAC (quarter-Kelly padrão)
@@ -158,7 +171,7 @@ def kelly_size(
       - Aplica hard cap de MAX_POSITION_PCT do capital
 
     Args:
-        edge:          |fair_prob - market_price|, esperança de lucro por unidade
+        edge:          fair_prob - market_price, esperança de lucro por unidade de prob.
         entry_price:   preço pago pelo token (já com spread/slippage)
         capital:       caixa disponível em USDC
         confidence:    score de confiança do sinal (0–1), calculado em signal_generator
@@ -181,14 +194,19 @@ def kelly_size(
         logger.debug(f"Confiança {confidence:.2f} abaixo do mínimo {min_conf} para {signal_source}")
         return 0.0
 
-    # Full Kelly fraction
-    odds_ratio = (1.0 / entry_price) - 1.0        # ganho por unidade apostada
-    kelly_full = edge / odds_ratio                  # f* = edge / odds
+    # Full Kelly fraction: f* = edge / (1 - entry_price) — ver derivação no
+    # docstring. P1-9: a fórmula antiga (edge / odds_ratio) multiplicava isto
+    # por entry_price, subdimensionando sistematicamente.
+    kelly_full = edge / (1.0 - entry_price)
 
-    # Clamp kelly_full antes de aplicar confidence:
-    # tokens deep-OTM (entry_price << 0.10) geram odds_ratio > 9 e kelly_full absurdo.
-    # Cap em 0.10 (10% do capital como fração máxima pré-ajuste) evita posições gigantes.
-    kelly_full = min(kelly_full, 0.10)
+    # P1-10: o clamp protege contra entry_price ALTO, não baixo — o comentário
+    # antigo dizia o oposto ("tokens deep-OTM geram kelly absurdo"), mas é
+    # p → 0 que faz f* → edge (pequeno e limitado); é p → 1 (token quase
+    # certo, ex. 0.95) que faz (1-p) → 0 e f* explodir para qualquer edge não
+    # trivial. Cap em KELLY_FULL_CAP (10% do capital, fração cheia pré-ajuste)
+    # evita apostar o book inteiro num token "quase resolvido" que na
+    # verdade não resolveu.
+    kelly_full = min(kelly_full, KELLY_FULL_CAP)
 
     # Cap de posição por trade_type
     pos_pct  = MAX_POSITION_PCT.get(trade_type, MAX_POSITION_PCT_DEFAULT)
