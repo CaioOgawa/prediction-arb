@@ -660,6 +660,13 @@ def generate_deribit_signals(
         df["edge"] = (df["prob_yes"] - df["yes_price"]).round(4)
     df["abs_edge"] = df["edge"].abs().round(4)
     df["signal_source"] = "deribit"
+    # P1-17: sem isso, sinais deribit nunca carregavam trade_type — em
+    # load_signals(mode="all"), concat com sinais odds (que TÊM a coluna)
+    # sobra NaN pros deribit, e str(nan) vira a string 'nan' rio abaixo, que
+    # não casa em nenhum dict keyed por trade_type. Deribit é aposta
+    # direcional B-S até a resolução, não rotação rápida — "value" é o tipo
+    # certo, não um fallback arbitrário.
+    df["trade_type"] = "value"
 
     # Score de confiança: tempo curto (γ alto) + IV alta (B-S incerto) reduzem confiança
     df["confidence"] = df.apply(

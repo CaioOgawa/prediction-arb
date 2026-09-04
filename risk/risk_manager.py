@@ -67,6 +67,38 @@ MAX_POSITION_PCT = {
     "value":    0.030,   # 3.0% — hold longer, mais convicção
 }
 MAX_POSITION_PCT_DEFAULT = 0.020   # fallback para sinais sem trade_type
+VALID_TRADE_TYPES = {"momentum", "value", "arb"}
+
+
+def normalize_trade_type(raw, context: str = "", warn: bool = True) -> str:
+    """
+    P1-17: `str(signal.get("trade_type", "value"))` aplicado a um NaN do
+    pandas (`float('nan')`, não `None`) produz a STRING `'nan'` — que não é
+    chave válida em nenhum dict keyed por trade_type (`MAX_POSITION_PCT`,
+    `EARLY_EXIT`) e não casa no filtro `!= "arb"` do `check_exposure`. Três
+    fallbacks silenciosos, nenhum logado — 17 posições reais contaminadas
+    com essa string antes deste fix (auditoria 2026-09-03).
+
+    Normaliza qualquer entrada não reconhecida — NaN, None, string vazia,
+    typo — para `"value"` (o fallback mais conservador: hold até resolução,
+    sem a rotação rápida do momentum) e loga em vez de falhar em silêncio.
+    `warn=False` pra normalização em massa de linhas já existentes no banco
+    (ex: cada leitura de `get_open_positions`) — o warning importa no
+    caminho de escrita, onde sinaliza contaminação nova, não a cada leitura
+    de posições já conhecidas.
+    """
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        text = ""
+    else:
+        text = str(raw).strip().lower()
+    if text in VALID_TRADE_TYPES:
+        return text
+    if warn:
+        logger.warning(
+            f"trade_type inválido/ausente ({raw!r}) — usando fallback 'value'"
+            + (f" [{context}]" if context else "")
+        )
+    return "value"
 
 # Diversificação
 MAX_CATEGORY_PCT   = 0.30   # 30% do capital por categoria
@@ -331,18 +363,26 @@ def check_exposure(
 
     # 2. Limite global de posições simultâneas
     # Pernas de arb (trade_type='arb') não contam: têm limite próprio
-    # (MAX_ARB_BASKETS) e não podem espremer os slots direcionais.
-    if "trade_type" in open_positions.columns:
-        n_directional = int((open_positions["trade_type"].fillna("value") != "arb").sum())
+    # (MAX_ARB_BASKETS) e não podem espremer os slots direcionais. Posição
+    # travada esperando revisão manual (P1-16) também não conta — o mercado
+    # dela já fechou, não é mais uma aposta ativa disputando slot. Só afeta
+    # esse contador: o resto (duplicata, caps de categoria/underlying) segue
+    # vendo a posição — o capital dela continua comprometido de verdade.
+    directional = open_positions
+    if "needs_manual_resolution" in directional.columns:
+        directional = directional[directional["needs_manual_resolution"].fillna(0) != 1]
+    if "trade_type" in directional.columns:
+        n_directional = int((directional["trade_type"].fillna("value") != "arb").sum())
     else:
-        n_directional = len(open_positions)
+        n_directional = len(directional)
     if n_directional >= MAX_OPEN_POSITIONS:
         return False, f"limite global de {MAX_OPEN_POSITIONS} posições atingido"
 
-    # 3. Limite por trade_type
-    trade_type = str(signal.get("trade_type", "value")).lower()
-    if "trade_type" in open_positions.columns:
-        type_count = (open_positions["trade_type"] == trade_type).sum()
+    # 3. Limite por trade_type (mesma exclusão de posição travada do item 2 —
+    # é o mesmo limite de slot, só particionado por tipo)
+    trade_type = normalize_trade_type(signal.get("trade_type"), context="check_exposure")
+    if "trade_type" in directional.columns:
+        type_count = (directional["trade_type"] == trade_type).sum()
         type_limit = MAX_MOMENTUM_POS if trade_type == "momentum" else MAX_VALUE_POS
         if type_count >= type_limit:
             return False, f"limite de posições {trade_type} ({type_limit}) atingido"
@@ -403,11 +443,11 @@ def check_exposure(
     direction = str(signal.get("direction", "")).upper()
     if direction in ("BUY_YES", "BUY_NO") and trade_type != "arb" \
             and {"trade_type", "direction"} <= set(open_positions.columns):
-        directional = open_positions[open_positions["trade_type"].fillna("value") != "arb"]
-        if len(directional) >= MIN_POSITIONS_FOR_SKEW_CHECK:
-            total_directional_cost = float(directional["cost_usdc"].sum()) + size_usdc
+        skew_book = open_positions[open_positions["trade_type"].fillna("value") != "arb"]
+        if len(skew_book) >= MIN_POSITIONS_FOR_SKEW_CHECK:
+            total_directional_cost = float(skew_book["cost_usdc"].sum()) + size_usdc
             same_dir_cost = float(
-                directional[directional["direction"] == direction]["cost_usdc"].sum()
+                skew_book[skew_book["direction"] == direction]["cost_usdc"].sum()
             ) + size_usdc
             if total_directional_cost > 0 and \
                     same_dir_cost / total_directional_cost > MAX_DIRECTIONAL_SKEW_PCT:
@@ -566,6 +606,9 @@ def resolve_positions(
       - BUY_YES + resolved YES:  lucro = (1.0 - entry_price) × shares
       - BUY_YES + resolved NO:   perda = -entry_price × shares
       - BUY_NO  + resolved NO:   lucro = (1.0 - entry_price) × shares
+      (entry_price aqui é o custo médio ponderado após qualquer aporte de
+      rebalance_positions, não necessariamente o preço da abertura original —
+      só assim (exit-entry)×shares reconcilia com cost_usdc; ver P1-15c)
       - BUY_NO  + resolved YES:  perda = -entry_price × shares
 
     Returns:
@@ -629,12 +672,28 @@ def resolve_positions(
             cost_usdc   = float(pos["cost_usdc"])
 
             if outcome is None:
-                # Mercado fechado sem resolução clara — marca como expirado e
-                # DEVOLVE o custo integral (P&L = 0). Sem outcome não há como
-                # calcular ganho/perda; exit_price = entry é só o registro disso.
-                exit_price = entry_price
-                pnl_usdc   = 0.0
-                status     = "expired"
+                # P1-16: mercado fechado (is_closed=True) sem outcomePrices
+                # parseável. Fechar como "expired" com P&L=0 devolvia o custo
+                # integral — uma garantia que não existe: na resolução real,
+                # um dos dois lados vale exatamente 0, não "empate". Isso
+                # inflava performance sistematicamente (nenhuma perda nunca
+                # registrada por essa via) e P0-2 é exatamente a condição que
+                # produz esse cenário em massa (parquet velho sem outcome pra
+                # mercado que já fechou). Em vez de fabricar um resultado,
+                # deixa ABERTA e marca pra revisão manual — sem tocar cash.
+                if not dry_run and conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "UPDATE positions SET needs_manual_resolution=1 WHERE id=?",
+                        (int(pos["id"]),),
+                    )
+                    conn.commit()
+                logger.warning(
+                    f"Posição {pos['id']} ({cid[:16]}) fechou sem outcome parseável "
+                    f"(outcomePrices={outcome_raw!r}) — marcada needs_manual_resolution, "
+                    "NÃO fechada automaticamente"
+                )
+                continue
             else:
                 # YES ganhou = token YES vale 1.0, token NO vale 0.0
                 yes_won = (outcome == 1)
@@ -665,7 +724,7 @@ def resolve_positions(
                 conn.execute("BEGIN IMMEDIATE")
                 cur = conn.execute("""
                     UPDATE positions
-                    SET closed_at=?, exit_price=?, pnl_usdc=?, status=?
+                    SET closed_at=?, exit_price=?, pnl_usdc=?, status=?, needs_manual_resolution=0
                     WHERE id=? AND status NOT IN ('closed', 'expired')
                 """, (now_str, exit_price, pnl_usdc, status, int(pos["id"])))
                 if cur.rowcount == 0:
@@ -685,7 +744,8 @@ def resolve_positions(
                 """, (
                     status.upper(), cid, direction,
                     exit_price, shares, cost_usdc + pnl_usdc,
-                    f"resolved outcome={'YES' if outcome==1 else 'NO' if outcome==0 else 'expired'}",
+                    # outcome nunca é None aqui — o caso 'expired' faz continue antes deste ponto (P1-16)
+                    f"resolved outcome={'YES' if outcome == 1 else 'NO'}",
                 ))
                 conn.commit()
 
@@ -694,6 +754,30 @@ def resolve_positions(
             conn.close()
 
     return resolved
+
+
+def find_positions_needing_manual_resolution(db_path: Path) -> pd.DataFrame:
+    """
+    P1-16: posições que `resolve_positions` encontrou fechadas (`closed=True`
+    na Gamma) mas sem `outcomePrices` parseável pra saber qual lado ganhou.
+    Ficam ABERTAS com `needs_manual_resolution=1` em vez de serem
+    encerradas com um resultado fabricado (P&L=0, devolução integral).
+
+    Chamado pelo operador (ou pelo ciclo, pra alertar) — resolver significa
+    checar o mercado manualmente na Polymarket e fechar a posição com
+    `resolve_positions` de novo depois que a API tiver outcome parseável, ou
+    fechar na mão via SQL direto se o mercado nunca vai ter outcome (raro).
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query("""
+            SELECT id, condition_id, question, direction, entry_price, cost_usdc, opened_at
+            FROM positions
+            WHERE status = 'open' AND needs_manual_resolution = 1
+        """, conn)
+    finally:
+        conn.close()
+    return df
 
 
 def find_orphan_arb_legs(db_path: Path) -> pd.DataFrame:
@@ -835,7 +919,7 @@ def early_exit_positions(
                 continue
 
             # Parâmetros de early exit dependem do trade_type da posição
-            trade_type  = str(pos.get("trade_type", "value"))
+            trade_type  = normalize_trade_type(pos.get("trade_type"), context="early_exit_positions", warn=False)
             exit_params = EARLY_EXIT.get(trade_type, EARLY_EXIT_DEFAULT)
             profit_mult = exit_params["profit_target_mult"]
             flip_delta  = exit_params["edge_flip_delta"]

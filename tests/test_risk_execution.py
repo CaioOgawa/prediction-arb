@@ -448,8 +448,9 @@ def trading_db(tmp_path):
     sys.path.insert(0, str(ROOT / "execution"))
     import paper_trader
     conn.executescript(paper_trader.SCHEMA)
-    # trade_type é coluna de migração (não está no SCHEMA base)
+    # trade_type/needs_manual_resolution são colunas de migração (não estão no SCHEMA base)
     conn.execute("ALTER TABLE positions ADD COLUMN trade_type TEXT DEFAULT 'value'")
+    conn.execute("ALTER TABLE positions ADD COLUMN needs_manual_resolution INTEGER DEFAULT 0")
     conn.execute(
         "INSERT INTO portfolio (initial_capital, current_cash) VALUES (1000, 1000)"
     )
@@ -645,6 +646,79 @@ class TestResolveThresholdNaoEhPreco:
         }])
         resolved = risk_manager.resolve_positions(open_pos, mkt, trading_db)
         assert resolved == []
+
+
+class TestExpiredNaoDevolveCustoIntegral:
+    """
+    P1-16: mercado fechado (closed=True) sem outcomePrices parseável não
+    pode virar status='expired' com P&L=0 (devolução integral) — é uma
+    garantia que não existe, um dos lados sempre vale 0 na resolução real.
+    Fica ABERTA e marcada needs_manual_resolution, sem tocar cash.
+    """
+
+    def test_closed_sem_outcome_prices_nao_fecha_nem_devolve_custo(self, trading_db):
+        cash_antes = _cash(trading_db)
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "closed": True,
+            "outcomePrices": None,
+        }])
+        resolved = risk_manager.resolve_positions(open_pos, mkt, trading_db)
+
+        assert resolved == []
+        assert _cash(trading_db) == cash_antes  # nenhum crédito fabricado
+        still_open = _open_positions_df(trading_db)
+        assert len(still_open) == 1 and still_open.iloc[0]["status"] == "open"
+        assert int(still_open.iloc[0]["needs_manual_resolution"]) == 1
+
+    def test_closed_com_outcome_prices_json_invalido_nao_fecha(self, trading_db):
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "closed": True,
+            "outcomePrices": "not-json-at-all",
+        }])
+        resolved = risk_manager.resolve_positions(open_pos, mkt, trading_db)
+        assert resolved == []
+        assert _open_positions_df(trading_db).iloc[0]["status"] == "open"
+
+    def test_dry_run_nao_grava_a_flag(self, trading_db):
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{"conditionId": "0xaaa", "closed": True, "outcomePrices": None}])
+        risk_manager.resolve_positions(open_pos, mkt, trading_db, dry_run=True)
+        # dry_run não deve alterar o banco de jeito nenhum
+        assert int(_open_positions_df(trading_db).iloc[0]["needs_manual_resolution"]) == 0
+
+    def test_find_positions_needing_manual_resolution_acha_a_posicao_flagada(self, trading_db):
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{"conditionId": "0xaaa", "closed": True, "outcomePrices": None}])
+        risk_manager.resolve_positions(open_pos, mkt, trading_db)
+
+        stuck = risk_manager.find_positions_needing_manual_resolution(trading_db)
+        assert len(stuck) == 1
+        assert stuck.iloc[0]["condition_id"] == "0xaaa"
+
+    def test_posicao_normal_nao_aparece_na_busca(self, trading_db):
+        # Sanity: sem nenhuma resolução ambígua, a busca não acha nada.
+        stuck = risk_manager.find_positions_needing_manual_resolution(trading_db)
+        assert stuck.empty
+
+    def test_flag_some_quando_outcome_prices_chega_num_ciclo_seguinte(self, trading_db):
+        # Ciclo 1: fecha sem outcomePrices parseável, fica travada.
+        open_pos = _open_positions_df(trading_db)
+        mkt_sem_outcome = pd.DataFrame([{"conditionId": "0xaaa", "closed": True, "outcomePrices": None}])
+        risk_manager.resolve_positions(open_pos, mkt_sem_outcome, trading_db)
+        assert int(_open_positions_df(trading_db).iloc[0]["needs_manual_resolution"]) == 1
+
+        # Ciclo 2: a API finalmente devolve outcomePrices — resolve normal,
+        # e a flag não pode sobreviver numa posição que já fechou de verdade.
+        open_pos = _open_positions_df(trading_db)
+        mkt_com_outcome = pd.DataFrame([{
+            "conditionId": "0xaaa", "closed": True, "outcomePrices": "[1, 0]",
+        }])
+        resolved = risk_manager.resolve_positions(open_pos, mkt_com_outcome, trading_db)
+
+        assert len(resolved) == 1
+        assert risk_manager.find_positions_needing_manual_resolution(trading_db).empty
 
 
 class TestKelly:
@@ -1318,6 +1392,166 @@ class TestDirectionalSkew:
         assert ok, reason
 
 
+class TestNormalizeTradeType:
+    """P1-17: str(float('nan')) == 'nan' — string, não None, não casa em
+    nenhum dict keyed por trade_type. 17 posições reais contaminadas em
+    produção antes deste fix (backfill aplicado em 2026-09-04)."""
+
+    def test_nan_float_vira_value(self):
+        assert risk_manager.normalize_trade_type(float("nan")) == "value"
+
+    def test_none_vira_value(self):
+        assert risk_manager.normalize_trade_type(None) == "value"
+
+    def test_string_literal_nan_vira_value(self):
+        # A contaminação real: a string 'nan' já gravada no banco.
+        assert risk_manager.normalize_trade_type("nan") == "value"
+
+    def test_string_vazia_vira_value(self):
+        assert risk_manager.normalize_trade_type("") == "value"
+
+    def test_typo_vira_value(self):
+        assert risk_manager.normalize_trade_type("valeu") == "value"
+
+    def test_valores_validos_passam_intactos(self):
+        for t in ("momentum", "value", "arb"):
+            assert risk_manager.normalize_trade_type(t) == t
+        assert risk_manager.normalize_trade_type("MOMENTUM") == "momentum"  # case-insensitive
+
+    def test_warn_false_nao_loga(self, caplog):
+        # get_open_positions usa warn=False — não pode spammar log a cada
+        # leitura de posições já conhecidas (o warning importa na escrita).
+        import io
+        from loguru import logger as loguru_logger
+        buf = io.StringIO()
+        sink_id = loguru_logger.add(buf, level="WARNING")
+        try:
+            risk_manager.normalize_trade_type("nan", warn=False)
+        finally:
+            loguru_logger.remove(sink_id)
+        assert buf.getvalue() == ""
+
+
+class TestGetOpenPositionsNormalizaTradeType:
+    def test_string_nan_do_banco_vira_value_na_leitura(self, tmp_path, monkeypatch):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = tmp_path / "paper.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(paper_trader.SCHEMA)
+        conn.execute("ALTER TABLE positions ADD COLUMN trade_type TEXT DEFAULT 'value'")
+        conn.execute("""
+            INSERT INTO positions
+              (condition_id, question, direction, entry_price, shares, cost_usdc,
+               status, trade_type, opened_at)
+            VALUES ('0xaaa', 'Teste?', 'BUY_YES', 0.10, 10.0, 1.0,
+                    'open', 'nan', '2026-01-01 00:00:00')
+        """)
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+        df = paper_trader.get_open_positions()
+        assert df.iloc[0]["trade_type"] == "value"
+
+
+class TestRebalancePositionsCorrigido:
+    """
+    P1-15: rebalance_positions tinha três bugs no mesmo bloco:
+      15a — sem guarda de arb, uma perna de basket podia receber mais shares
+            sozinha, destruindo a invariante de shares iguais que torna o
+            basket riskless.
+      15b — usava o preço BID (de mark_to_market) como preço de compra do
+            aporte; aportar é COMPRAR, que executa no ASK.
+      15c — sobrescrevia entry_price pro custo médio (mantido — é o correto
+            pra P&L/thresholds ancorados em custo; ver nota no commit).
+    """
+
+    def _seed_db(self, tmp_path, trade_type="value", cost_usdc=10.0, shares=100.0,
+                 entry_price=0.10, prob_at_entry=0.60, confidence=1.0, signal_source="odds"):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = tmp_path / "paper.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(paper_trader.SCHEMA)
+        conn.execute("ALTER TABLE positions ADD COLUMN trade_type TEXT DEFAULT 'value'")
+        conn.execute("INSERT INTO portfolio (initial_capital, current_cash) VALUES (1000, 1000)")
+        conn.execute("""
+            INSERT INTO positions
+              (condition_id, question, direction, entry_price, shares, cost_usdc,
+               prob_at_entry, confidence, signal_source, status, trade_type, opened_at)
+            VALUES ('0xaaa', 'Teste?', 'BUY_YES', ?, ?, ?, ?, ?, ?, 'open', ?, '2026-01-01 00:00:00')
+        """, (entry_price, shares, cost_usdc, prob_at_entry, confidence, signal_source, trade_type))
+        conn.commit()
+        conn.close()
+        return db
+
+    # yes_price=0.31, spread=0.02 → current_price (bid) = 0.31-0.01 = 0.30;
+    # new_entry (ask, pós-fix) = 0.30+0.02 = 0.32.
+    MKT = pd.DataFrame([{
+        "conditionId": "0xaaa", "yes_price": 0.31, "spread": 0.02, "liquidity": 10_000.0,
+    }])
+
+    def test_pula_pernas_de_arb(self, tmp_path, monkeypatch):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = self._seed_db(tmp_path, trade_type="arb")
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+
+        open_pos = _open_positions_df(db)
+        mtm = paper_trader.mark_to_market(open_pos, self.MKT)
+        portfolio = {"current_cash": 1000.0, "initial_capital": 1000.0}
+        result = paper_trader.rebalance_positions(mtm, portfolio, dry_run=True)
+
+        assert result == []
+        # Confere que shares/cost_usdc no banco continuam intocados —
+        # a invariante de shares iguais entre pernas de arb sobrevive.
+        pos = _open_positions_df(db).iloc[0]
+        assert float(pos["shares"]) == 100.0
+        assert float(pos["cost_usdc"]) == 10.0
+
+    def test_compra_no_ask_nao_no_bid(self, tmp_path, monkeypatch):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = self._seed_db(tmp_path, trade_type="value")
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+
+        open_pos = _open_positions_df(db)
+        mtm = paper_trader.mark_to_market(open_pos, self.MKT)
+        assert mtm.iloc[0]["current_price"] == pytest.approx(0.30)  # bid — sanity do fixture
+
+        portfolio = {"current_cash": 1000.0, "initial_capital": 1000.0}
+        result = paper_trader.rebalance_positions(mtm, portfolio, dry_run=False)
+
+        assert len(result) == 1
+        pos = _open_positions_df(db).iloc[0]
+        # new_entry = ask (0.30+0.02=0.32), não o bid (0.30) que o código
+        # antigo usava. add_usdc=10 → add_shares = 10/0.32 = 31.25, não
+        # 10/0.30 = 33.33 (o que o bug antigo teria comprado).
+        add_usdc = result[0]["add_usdc"]
+        assert add_usdc == pytest.approx(10.0)
+        expected_shares = 100.0 + round(add_usdc / 0.32, 4)
+        assert float(pos["shares"]) == pytest.approx(expected_shares)
+        assert float(pos["shares"]) < 100.0 + round(add_usdc / 0.30, 4)  # menos shares que o bug antigo daria
+        assert float(pos["cost_usdc"]) == pytest.approx(20.0)
+
+    def test_trade_type_invalido_na_posicao_nao_quebra_e_vira_value(self, tmp_path, monkeypatch):
+        # P1-17: uma posição com trade_type='nan' (contaminação real já
+        # encontrada em produção) não pode travar o rebalance nem ser tratada
+        # como arb por acidente — normalize_trade_type cai pra 'value'.
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = self._seed_db(tmp_path, trade_type="nan")
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+
+        open_pos = _open_positions_df(db)
+        mtm = paper_trader.mark_to_market(open_pos, self.MKT)
+        portfolio = {"current_cash": 1000.0, "initial_capital": 1000.0}
+        result = paper_trader.rebalance_positions(mtm, portfolio, dry_run=True)
+
+        assert len(result) == 1  # tratado como 'value', não pulado como se fosse 'arb'
+
+
 class TestKellyCorrelacao:
     """P1-11d: Kelly independente sobre apostas correlacionadas (mesmo
     underlying) superaposta risco — escala por 1/n_correlated."""
@@ -1627,6 +1861,57 @@ class TestOpenPositionUsaEntryPriceReal:
 
         assert pos is not None
         assert pos["entry_price"] < 0.55  # veio do book fresco, não do 0.60 stale
+
+
+class TestOpenPositionIgnoraPosicoesTravadas:
+    """
+    P1-16 (revisão do advisor): sem isso, uma posição needs_manual_resolution=1
+    fica 'open' pra sempre (mercado fechou, ninguém nunca resolve) e ocupava
+    slot/cap de exposição indefinidamente — sinais novos eram rejeitados por
+    causa de uma posição que não é mais uma aposta ativa.
+    """
+
+    def _travadas(self, n):
+        return pd.DataFrame(
+            [
+                # metade BUY_YES, metade BUY_NO — só pra não disparar o cap de
+                # skew direcional (item 7 de check_exposure), que é ortogonal
+                # ao que este teste cobre.
+                {"condition_id": f"0x{i}", "direction": "BUY_YES" if i % 2 == 0 else "BUY_NO",
+                 "cost_usdc": 5.0, "trade_type": "value", "needs_manual_resolution": 1}
+                for i in range(n)
+            ]
+        )
+
+    SIGNAL = {
+        "condition_id": "0xnovo", "direction": "BUY_YES", "trade_type": "value",
+        "signal_source": "odds", "category": "", "underlying": "",
+    }
+
+    def test_posicoes_travadas_nao_contam_no_limite_global(self):
+        from risk_manager import check_exposure, MAX_OPEN_POSITIONS
+
+        ok, reason = check_exposure(
+            self.SIGNAL, self._travadas(MAX_OPEN_POSITIONS),
+            {"initial_capital": 1000.0}, 5.0,
+        )
+        # Antes da correção: MAX_OPEN_POSITIONS posições travadas bloqueavam
+        # qualquer sinal novo ("limite global atingido") mesmo com todo mundo
+        # esperando revisão manual, não disputando capital de verdade.
+        assert ok, reason
+
+    def test_duplicata_de_posicao_travada_continua_bloqueada(self):
+        # A exclusão do limite global NÃO pode furar a checagem de duplicata —
+        # a posição travada continua com capital de verdade comprometido nela.
+        from risk_manager import check_exposure, MAX_OPEN_POSITIONS
+
+        signal = {**self.SIGNAL, "condition_id": "0x0"}  # mesmo cid de uma posição travada
+        ok, reason = check_exposure(
+            signal, self._travadas(MAX_OPEN_POSITIONS - 1),
+            {"initial_capital": 1000.0}, 5.0,
+        )
+        assert not ok
+        assert "já aberta" in reason
 
 
 class TestArbAlert:
@@ -2217,3 +2502,33 @@ class TestSignalGeneratorUsaEdgeDeVerdade:
         row = signals.iloc[0]
         # legado: prob_yes - yes_price = 0.65 - 0.50 = 0.15
         assert row["edge"] == pytest.approx(0.15)
+
+    def test_deribit_signals_sempre_carregam_trade_type_value(self, tmp_path, monkeypatch):
+        # P1-17: generate_deribit_signals nunca setava trade_type — em
+        # load_signals(mode="all"), o concat com sinais odds (que TÊM a
+        # coluna) sobrava NaN pros deribit, e str(nan)=='nan' rio abaixo.
+        # 17 posições reais em produção ficaram com trade_type='nan' por
+        # causa disso (backfill aplicado em 2026-09-04).
+        monkeypatch.setattr(signal_generator, "RAW_ODDS_DIR", tmp_path)
+        now = datetime.now(timezone.utc)
+        row = {
+            "condition_id": "0xdef", "question": "Bitcoin acima de $70k?",
+            "category": "crypto", "underlying": "BTC", "asset": "BTC", "strike": 70_000.0,
+            "direction": "above", "yes_price": 0.40, "entry_price": 0.42, "spread": 0.04,
+            "fair_prob": 0.55, "divergence": -0.15, "abs_divergence": 0.15,
+            "net_edge": 0.13, "signal": "BUY_YES", "is_touch": False,
+            "spot_price": 68_000.0, "iv": 0.55, "iv_pct": "55.0%", "T_days": 10.0,
+            "moneyness_pct": 0.03, "bs_reach": 0.10,
+            "deribit_expiry": (now + pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
+            "expiry_delta_d": 0, "liquidity": 10_000.0, "volume_24h": 50_000.0,
+            "hours_left": 240.0, "end_date": (now + pd.Timedelta(hours=240)).isoformat(),
+        }
+        path = tmp_path / "deribit_signals_20260101_000000.parquet"
+        pd.DataFrame([row]).to_parquet(path)
+
+        signals = signal_generator.generate_deribit_signals(
+            min_divergence=0.05, min_liquidity=1_000, min_hours_left=1.0,
+            save=False, fetch_fresh=False,
+        )
+        assert not signals.empty
+        assert (signals["trade_type"] == "value").all()

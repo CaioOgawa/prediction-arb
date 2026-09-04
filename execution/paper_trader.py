@@ -103,6 +103,7 @@ def init_db() -> None:
             ("event_slug", "TEXT DEFAULT ''"),
             ("arb_group", "TEXT DEFAULT ''"),
             ("underlying", "TEXT DEFAULT ''"),  # P1-11: ativo real (BTC/ETH, sport_key:matchup)
+            ("needs_manual_resolution", "INTEGER DEFAULT 0"),  # P1-16: fechou sem outcome parseável
         ]:
             if col_name not in existing:
                 # Bug pré-existente: o ALTER TABLE só usava {col}, descartando
@@ -138,7 +139,17 @@ def get_open_positions() -> pd.DataFrame:
         rows = conn.execute(
             "SELECT * FROM positions WHERE status = 'open'"
         ).fetchall()
-    return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
+    df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
+    if not df.empty and "trade_type" in df.columns:
+        # P1-17: normaliza na leitura — cobre tanto NaN/None quanto a string
+        # literal 'nan' que ficou gravada em posições antigas (fillna() não
+        # pega, porque 'nan' já é uma string válida do ponto de vista do
+        # pandas). Sem isso, os limites por trade_type (MAX_MOMENTUM_POS/
+        # MAX_VALUE_POS) nunca contam essas posições — o filtro não casa NaN.
+        sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
+        from risk_manager import normalize_trade_type
+        df["trade_type"] = df["trade_type"].apply(lambda x: normalize_trade_type(x, warn=False))
+    return df
 
 
 def get_traded_condition_ids() -> set[str]:
@@ -261,7 +272,7 @@ def open_position(
     Retorna o dict da posição ou None se rejeitada.
     """
     sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-    from risk_manager import kelly_size, check_exposure, MIN_EDGE_ABS
+    from risk_manager import kelly_size, check_exposure, MIN_EDGE_ABS, normalize_trade_type
     sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
     from market_pricing import entry_price_and_net_edge
 
@@ -271,7 +282,7 @@ def open_position(
     prob_yes     = float(signal.get("prob_yes", 0.5))
     confidence   = float(signal.get("confidence", 0.5))
     signal_source= str(signal.get("signal_source", "odds"))
-    trade_type   = str(signal.get("trade_type", "value"))
+    trade_type   = normalize_trade_type(signal.get("trade_type"), context="open_position")
     spread       = max(float(signal.get("spread") or 0), 0.005)
     cid          = str(signal.get("condition_id", ""))
 
@@ -406,6 +417,10 @@ def open_position(
     # drawdown em vez de apertar.
     open_pos = get_open_positions()
     total_value = cash + open_value
+    # P1-16: check_exposure exclui posição travada (needs_manual_resolution=1)
+    # só do contador de slot direcional — passa a lista completa aqui de
+    # propósito, pra manter a checagem de duplicata e os caps de
+    # categoria/underlying vendo o capital que continua comprometido nela.
     can_trade, reason = check_exposure(signal, open_pos, portfolio, size_usdc, total_value=total_value)
     if not can_trade:
         logger.info(f"REJEITADO [risco: {reason}] {_q}")
@@ -774,6 +789,7 @@ def mark_to_market(open_positions: pd.DataFrame, current_markets: pd.DataFrame) 
         if illiquid:
             # Sem liquidez — usa cost basis para não inflar P&L com preço fantasma
             current_price = float(pos["entry_price"])
+            spread = 0.0
             logger.debug(
                 f"MTM ilíquido ({liquidity:.0f} USDC < {MIN_LIQUIDITY_MTM:.0f}) "
                 f"— usando cost basis para {pos['condition_id'][:12]}"
@@ -791,6 +807,7 @@ def mark_to_market(open_positions: pd.DataFrame, current_markets: pd.DataFrame) 
 
         row = dict(pos)
         row["current_price"]  = round(current_price, 4)
+        row["spread"]         = round(spread, 4)  # P1-15b: rebalance precisa do ask, não só do bid
         row["current_value"]  = round(current_value, 2)
         row["unrealized_pnl"] = round(unrealized_pnl, 2)
         row["illiquid"]       = illiquid
@@ -816,7 +833,7 @@ def rebalance_positions(
     Retorna lista de dicts com as adições realizadas.
     """
     sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-    from risk_manager import kelly_size
+    from risk_manager import kelly_size, normalize_trade_type
 
     if open_positions_mtm.empty or "current_price" not in open_positions_mtm.columns:
         return []
@@ -829,21 +846,33 @@ def rebalance_positions(
         if pos.get("illiquid"):
             continue
 
+        trade_type   = normalize_trade_type(pos.get("trade_type"), context="rebalance_positions")
+        if trade_type == "arb":
+            # P1-15a: pernas de arb precisam de shares IGUAIS entre si — é o
+            # que torna o basket riskless (open_basket impõe essa invariante
+            # na abertura). Rebalancear uma perna isolada quebra a invariante
+            # e transforma um arb garantido numa aposta direcional nua sem
+            # que ninguém perceba (prob_at_entry de uma perna de arb É o
+            # preço de execução, então qualquer queda de preço parece "edge"
+            # positivo pro cálculo abaixo).
+            continue
+
         direction    = str(pos["direction"])
         entry_price  = float(pos["entry_price"])
         cost_usdc    = float(pos["cost_usdc"])
         fair_prob    = float(pos.get("prob_at_entry") or 0.5)
         current_price= float(pos["current_price"])
         signal_source= str(pos.get("signal_source", "odds"))
-        trade_type   = str(pos.get("trade_type", "value"))
         confidence   = float(pos.get("confidence") or 0.5)
         cid          = str(pos["condition_id"])
 
-        # Reconstrói yes_price atual a partir do current_price (bid side)
-        # BUY_YES: current_price ≈ yes_bid → yes_price ≈ current_price + spread/2
-        # BUY_NO:  current_price ≈ no_bid  → yes_price ≈ 1 - current_price - spread/2
-        # Usamos current_price como proxy conservador do preço de entrada adicional
-        new_entry = current_price
+        # P1-15b: current_price (de mark_to_market) é o lado BID — o preço
+        # que eu receberia se vendesse agora. Aportar significa COMPRAR mais,
+        # que executa no ASK. O código antigo usava current_price direto como
+        # "new_entry" (comentário dizia "proxy conservador"); na prática é
+        # anti-conservador por um spread inteiro — supõe que compra no bid.
+        spread    = float(pos.get("spread") or 0.01)
+        new_entry = min(current_price + spread, 0.98)
 
         if direction == "BUY_YES":
             new_edge = fair_prob - current_price
@@ -882,6 +911,12 @@ def rebalance_positions(
         add_shares = round(add_usdc / new_entry, 4)
         new_cost   = round(cost_usdc + add_usdc, 2)
         new_shares = round(float(pos["shares"]) + add_shares, 4)
+        # P1-15c: entry_price vira custo médio ponderado, não mais o preço da
+        # abertura original — de propósito. resolve_positions calcula pnl como
+        # (exit-entry)×shares com o shares JÁ somado do aporte; se entry_price
+        # ficasse congelado no valor original, esse pnl não reconciliaria com
+        # cost_usdc. edge_at_entry (não atualizado aqui) fica como registro do
+        # edge da abertura original — é só exibido em log, nada financeiro lê.
         new_avg_entry = round(new_cost / new_shares, 4)
 
         logger.info(
@@ -1008,7 +1043,7 @@ def run_paper_trading(
         resolve_positions, early_exit_positions, check_drawdown_stop,
         portfolio_risk_summary, MAX_OPEN_POSITIONS,
         MIN_SIGNAL_LIQUIDITY, MAX_SIGNALS_PER_CYCLE,
-        reclassify_orphan_arb_legs,
+        reclassify_orphan_arb_legs, find_positions_needing_manual_resolution,
     )
 
     # Defaults vêm do risk_manager — o CLI antigo travava em 10 posições
@@ -1065,6 +1100,27 @@ def run_paper_trading(
             logger.exception("Falha ao notificar reclassificação de pernas órfãs")
         open_pos  = get_open_positions()
         portfolio = get_or_create_portfolio(initial_capital)
+
+    # ── 1c. Posições precisando de revisão manual (P1-16) ──
+    # resolve_positions deixa ABERTA (não fecha com resultado fabricado)
+    # qualquer posição que fechou sem outcomePrices parseável. Sem correção
+    # automática possível (é decisão do operador), então alerta aqui — só
+    # no ciclo de 30min, não no run_execution de 5min, pra não spammar
+    # Telegram sobre a mesma posição parada a cada 5 minutos.
+    stuck = find_positions_needing_manual_resolution(DB_PATH)
+    if not stuck.empty:
+        console.print(f"[bold red]Posições precisando de revisão manual: {len(stuck)}[/bold red]")
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from notify import alert
+            questions = "; ".join(str(q)[:40] for q in stuck["question"].tolist())
+            alert(
+                f"{len(stuck)} posição(ões) fechada(s) sem outcome parseável, "
+                f"precisando revisão manual: {questions}",
+                cycle="paper_trader",
+            )
+        except Exception:
+            logger.exception("Falha ao notificar posições precisando de revisão manual")
 
     # ── 2. Saída antecipada ────────────────────────────
     open_pos = get_open_positions()
@@ -1149,11 +1205,15 @@ def run_paper_trading(
             ]
 
         signals_top = signals_df.head(top_signals)
-        # Pernas de arb não ocupam slots direcionais (mesma regra do check_exposure)
-        if not open_pos.empty and "trade_type" in open_pos.columns:
-            n_open = int((open_pos["trade_type"].fillna("value") != "arb").sum())
+        # Pernas de arb não ocupam slots direcionais (mesma regra do check_exposure);
+        # nem posições travadas esperando revisão manual (P1-16) — mercado já fechou.
+        open_pos_for_slots = open_pos
+        if not open_pos.empty and "needs_manual_resolution" in open_pos.columns:
+            open_pos_for_slots = open_pos[open_pos["needs_manual_resolution"].fillna(0) != 1]
+        if not open_pos_for_slots.empty and "trade_type" in open_pos_for_slots.columns:
+            n_open = int((open_pos_for_slots["trade_type"].fillna("value") != "arb").sum())
         else:
-            n_open = len(open_pos) if not open_pos.empty else 0
+            n_open = len(open_pos_for_slots) if not open_pos_for_slots.empty else 0
         slots   = max(0, max_positions - n_open)
         cash    = float(portfolio["current_cash"])
 
