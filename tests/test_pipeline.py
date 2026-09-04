@@ -560,3 +560,63 @@ class TestIntegration:
         metrics2 = run_incremental(min_volume=100_000, dry_run=False)
         assert metrics2["n_new"] == 0
         assert metrics2["n_total"] == metrics1["n_total"]
+
+
+# ===========================================================================
+# TestValidateConnection — P2-42: validador de .env e conectividade
+# ===========================================================================
+
+class _FakeResp:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception(f"HTTP {self.status_code}")
+    def json(self):
+        return self._payload
+
+
+class TestValidateConnection:
+    """P2-42: test_thegraph devolvia True em todo caminho, inclusive falha —
+    o __main__ então anunciava "todas as conexões validadas com sucesso"
+    mesmo com o TheGraph fora do ar. E check_env_vars checava
+    POLY_PROXY_WALLET/NEWSAPI_KEY (sem leitor nenhum no código) mas não
+    ODDS_API_KEY (a única credencial cuja ausência de fato derruba
+    odds_collector.py)."""
+
+    def test_thegraph_ok_devolve_true(self, monkeypatch):
+        import validate_connection as vc
+        monkeypatch.setattr(
+            vc.requests, "post",
+            lambda *a, **kw: _FakeResp({"data": {"fixedProductMarketMakers": []}}),
+        )
+        assert vc.test_thegraph() is True
+
+    def test_thegraph_erro_de_rede_devolve_false(self, monkeypatch):
+        import validate_connection as vc
+        def boom(*a, **kw):
+            raise Exception("Connection refused")
+        monkeypatch.setattr(vc.requests, "post", boom)
+        assert vc.test_thegraph() is False
+
+    def test_thegraph_resposta_com_errors_devolve_false(self, monkeypatch):
+        import validate_connection as vc
+        monkeypatch.setattr(
+            vc.requests, "post",
+            lambda *a, **kw: _FakeResp({"errors": ["subgraph indisponível"]}),
+        )
+        assert vc.test_thegraph() is False
+
+    def test_check_env_vars_inclui_odds_api_key(self, capsys):
+        import validate_connection as vc
+        vc.check_env_vars()
+        out = capsys.readouterr().out
+        assert "ODDS_API_KEY" in out
+
+    def test_check_env_vars_nao_checa_vars_mortas(self, capsys):
+        import validate_connection as vc
+        vc.check_env_vars()
+        out = capsys.readouterr().out
+        assert "POLY_PROXY_WALLET" not in out
+        assert "NEWSAPI_KEY" not in out

@@ -83,7 +83,13 @@ def test_thegraph() -> bool:
     """
     Testa subgraph Polymarket no TheGraph.
     Nota: o hosted service do TheGraph foi depreciado em 2024.
-    Esta verificação é não-bloqueante — usamos Gamma API como fonte primária.
+
+    P2-42: o retorno reflete o resultado real do teste — antes retornava
+    True em todo caminho, inclusive falha, então "todas as conexões
+    validadas com sucesso" no __main__ mentia quando o TheGraph estava fora
+    do ar. "Não-bloqueante" é decisão de quem chama (__main__ não inclui
+    isso no gate de sucesso porque é fonte secundária), não uma mentira
+    embutida no valor de retorno.
     """
     # Endpoint do subgraph na rede descentralizada do TheGraph
     url = "https://gateway.thegraph.com/api/subgraphs/id/81Dm16JjuFSrqz813HysXoUPvzTwE7fsfPk2RTf66nyC"
@@ -92,27 +98,33 @@ def test_thegraph() -> bool:
         r = requests.post(url, json={"query": query}, timeout=10)
         r.raise_for_status()
         data = r.json()
-        if "errors" not in data:
-            print("  [OK] TheGraph (rede descentralizada)")
-        else:
+        if "errors" in data:
             print(f"  [AVISO] TheGraph retornou erros: {data['errors']}")
+            return False
+        print("  [OK] TheGraph (rede descentralizada)")
         return True
     except Exception as e:
         # Não-bloqueante: TheGraph é fonte secundária
         print(f"  [AVISO] TheGraph indisponivel (nao-bloqueante): {type(e).__name__}")
         print("           Fonte primaria (Gamma API) esta OK — pode continuar.")
-        return True  # Nao falha o pipeline por isso
+        return False
 
 
 def check_env_vars() -> None:
     """Informa quais variáveis de ambiente estão configuradas"""
+    # P2-42: POLY_PROXY_WALLET/NEWSAPI_KEY nunca tiveram leitor no código —
+    # tiradas daqui junto da remoção do .env/.env.example. ODDS_API_KEY é a
+    # única credencial cuja ausência de fato levanta exceção
+    # (odds_collector.py) e não estava sendo checada; TELEGRAM_* faltando
+    # significa degradação silenciosa sem alerta nenhum.
     vars_to_check = [
         "POLY_PRIVATE_KEY",
         "POLY_API_KEY",
         "POLY_API_SECRET",
         "POLY_API_PASSPHRASE",
-        "POLY_PROXY_WALLET",
-        "NEWSAPI_KEY",
+        "ODDS_API_KEY",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID",
         "TRADING_MODE",
     ]
     print("\n  Variáveis de ambiente:")
@@ -129,15 +141,20 @@ if __name__ == "__main__":
     check_env_vars()
 
     print("\n  Testando APIs:")
-    results = [
+    # P2-42: TheGraph é fonte secundária e não-bloqueante de propósito — fica
+    # fora do gate de sucesso (critical), mas o resultado real é reportado,
+    # não escondido atrás de um True fixo.
+    critical = [
         test_gamma_api(),
         test_clob_api_public(),
         test_clob_api_auth(),
-        test_thegraph(),
     ]
+    thegraph_ok = test_thegraph()
+    if not thegraph_ok:
+        print("  [AVISO] TheGraph indisponível — não bloqueia (fonte secundária).")
 
     print()
-    if all(results):
+    if all(critical):
         print("=== Todas as conexoes validadas com sucesso! ===")
         print("\nProximos passos:")
         print("  1. Configure o .env com suas credenciais Polymarket")
