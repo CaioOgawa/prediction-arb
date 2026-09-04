@@ -962,9 +962,9 @@ def run_paper_trading(
     initial_capital: float = 1_000.0,
     max_positions: int | None = None,
     edge_threshold: float | None = None,
-    min_liquidity: float = 5_000.0,
+    min_liquidity: float | None = None,
     dry_run: bool = False,
-    top_signals: int = 30,
+    top_signals: int | None = None,
     mode: str = "odds",
 ) -> None:
     """
@@ -979,6 +979,7 @@ def run_paper_trading(
     from risk_manager import (
         resolve_positions, early_exit_positions, check_drawdown_stop,
         portfolio_risk_summary, MAX_OPEN_POSITIONS,
+        MIN_SIGNAL_LIQUIDITY, MAX_SIGNALS_PER_CYCLE,
         reclassify_orphan_arb_legs,
     )
 
@@ -986,6 +987,10 @@ def run_paper_trading(
     # enquanto o limite real era 20 (constante duplicada, bug da auditoria).
     if max_positions is None:
         max_positions = MAX_OPEN_POSITIONS
+    if min_liquidity is None:
+        min_liquidity = MIN_SIGNAL_LIQUIDITY
+    if top_signals is None:
+        top_signals = MAX_SIGNALS_PER_CYCLE
 
     init_db()
     portfolio = get_or_create_portfolio(initial_capital)
@@ -1049,7 +1054,26 @@ def run_paper_trading(
             open_pos  = get_open_positions()
             portfolio = get_or_create_portfolio(initial_capital)
 
-    # ── 3. Rebalanceamento de posições ─────────────────
+    # ── 3. Verifica stop loss (valor total, antes de rebalance/baskets/aberturas) ──
+    # P1-12: precisa vir ANTES do rebalance — senão um portfólio em halt
+    # continua recebendo mais capital em posições já perdedoras via
+    # rebalance_positions, e o stop nunca protege delas (só bloqueava
+    # abertura de posição nova). total_value = cash + MTM alimenta o cap de
+    # drawdown do pico (check_drawdown_stop grava em portfolio_equity); os
+    # stops de P&L realizado (semanal/diário) continuam checados também.
+    open_pos = get_open_positions()
+    mtm_for_stop = mark_to_market(open_pos, current_markets) if not open_pos.empty and not current_markets.empty else open_pos
+    pos_value_for_stop = float(mtm_for_stop["current_value"].sum()) if "current_value" in mtm_for_stop.columns else float(open_pos.get("cost_usdc", pd.Series([0])).sum()) if not open_pos.empty else 0.0
+    total_value_for_stop = float(portfolio["current_cash"]) + pos_value_for_stop
+
+    stop, reason = check_drawdown_stop(portfolio, DB_PATH, total_value=total_value_for_stop, record=True)
+    if stop:
+        console.print(f"\n[bold red]STOP LOSS ATIVADO: {reason}[/bold red]")
+        console.print("[dim]Novas posições, rebalance e baskets suspensos. Apenas monitorando portfólio atual.[/dim]\n")
+        print_portfolio(portfolio, mtm_for_stop if not mtm_for_stop.empty else pd.DataFrame())
+        return
+
+    # ── 3b. Rebalanceamento de posições ─────────────────
     open_pos = get_open_positions()
     if not open_pos.empty and not current_markets.empty:
         open_pos_mtm = mark_to_market(open_pos, current_markets)
@@ -1063,17 +1087,6 @@ def run_paper_trading(
                 )
             open_pos  = get_open_positions()
             portfolio = get_or_create_portfolio(initial_capital)
-
-    # ── 4. Verifica stop loss ───────────────────────────
-    stop, reason = check_drawdown_stop(portfolio, DB_PATH)
-    if stop:
-        console.print(f"\n[bold red]STOP LOSS ATIVADO: {reason}[/bold red]")
-        console.print("[dim]Novas posições suspensas. Apenas monitorando portfólio atual.[/dim]\n")
-        # Exibe portfólio mas não opera
-        open_pos = get_open_positions()
-        mtm = mark_to_market(open_pos, current_markets) if not open_pos.empty and not current_markets.empty else open_pos
-        print_portfolio(portfolio, mtm if not mtm.empty else pd.DataFrame())
-        return
 
     # ── 4.5 Baskets de arb estrutural (execução atômica) ──
     # Só baskets GARANTIDOS do CSV do scanner; cada basket abre todas as

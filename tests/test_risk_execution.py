@@ -1393,6 +1393,154 @@ class TestKellyCorrelacao:
         assert "kelly_pequeno" not in output
 
 
+class TestDrawdownPico:
+    """P1-12: os stops de WEEKLY_STOP_PCT/DAILY_STOP_PCT só enxergam P&L
+    REALIZADO — um portfólio pode estar -40% em mark-to-market sem nenhum
+    fechamento e o stop nunca dispara. check_drawdown_stop(..., total_value=X)
+    adiciona um terceiro stop sobre valor total contra o pico já visto,
+    persistido em portfolio_equity."""
+
+    @pytest.fixture()
+    def empty_db(self, tmp_path):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = tmp_path / "paper.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(paper_trader.SCHEMA)
+        conn.execute("INSERT INTO portfolio (id, initial_capital, current_cash) VALUES (1, 1000, 1000)")
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_sem_total_value_nao_mexe_em_portfolio_equity(self, empty_db):
+        # Compatibilidade: chamador que não passa total_value (nenhum hoje,
+        # mas pode existir código legado) não cria a tabela nem quebra.
+        portfolio = {"id": 1, "initial_capital": 1000.0}
+        stop, reason = risk_manager.check_drawdown_stop(portfolio, empty_db)
+        assert stop is False
+        conn = sqlite3.connect(empty_db)
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        conn.close()
+        assert "portfolio_equity" not in tables
+
+    def test_primeira_leitura_vira_o_proprio_pico_nao_dispara(self, empty_db):
+        # Sem histórico, o valor atual É o pico — drawdown=0, não dispara.
+        portfolio = {"id": 1, "initial_capital": 1000.0}
+        stop, reason = risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=1000.0, record=True)
+        assert stop is False
+
+    def test_queda_alem_do_cap_dispara_mesmo_sem_pnl_realizado(self, empty_db):
+        # Cenário do P1-12: portfólio -40% em MTM, zero posições fechadas.
+        # Sem total_value isso passaria batido; com ele, dispara.
+        portfolio = {"id": 1, "initial_capital": 1000.0}
+        risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=1000.0, record=True)  # fixa o pico
+        stop, reason = risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=600.0, record=True)
+        assert stop is True
+        assert "pico" in reason
+
+    def test_queda_dentro_do_cap_nao_dispara(self, empty_db):
+        portfolio = {"id": 1, "initial_capital": 1000.0}
+        risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=1000.0, record=True)
+        stop, reason = risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=850.0, record=True)  # -15%, cap é 20%
+        assert stop is False
+
+    def test_recuperacao_nao_reseta_o_pico(self, empty_db):
+        # O pico é o MAIOR valor já visto, não o mais recente — subir de novo
+        # depois de cair não "perdoa" o drawdown contra o teto histórico.
+        portfolio = {"id": 1, "initial_capital": 1000.0}
+        risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=1000.0, record=True)
+        risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=1200.0, record=True)  # novo pico
+        stop, reason = risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=950.0, record=True)  # -20.8% do pico 1200
+        assert stop is True
+
+    def test_portfolios_diferentes_nao_compartilham_pico(self, empty_db):
+        # Reset de portfólio (novo id) não deve herdar o high-water mark do anterior.
+        conn = sqlite3.connect(empty_db)
+        conn.execute("INSERT INTO portfolio (id, initial_capital, current_cash) VALUES (2, 500, 500)")
+        conn.commit()
+        conn.close()
+
+        risk_manager.check_drawdown_stop({"id": 1, "initial_capital": 1000.0}, empty_db, total_value=1000.0, record=True)
+        # Portfólio novo com valor bem menor não deve disparar contra o pico do #1.
+        stop, reason = risk_manager.check_drawdown_stop(
+            {"id": 2, "initial_capital": 500.0}, empty_db, total_value=500.0, record=True,
+        )
+        assert stop is False
+
+    def test_check_sem_record_nao_grava_mas_ainda_compara_com_pico_existente(self, empty_db):
+        # portfolio_risk_summary usa record=False (é leitura, não pode definir
+        # o pico) mas ainda precisa DETECTAR um halt já em curso — senão o
+        # sumário de risco mostra stop_triggered=False durante um halt real.
+        portfolio = {"id": 1, "initial_capital": 1000.0}
+        risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=1000.0, record=True)  # fixa o pico
+        stop, _ = risk_manager.check_drawdown_stop(portfolio, empty_db, total_value=600.0, record=False)
+        assert stop is True
+
+        conn = sqlite3.connect(empty_db)
+        n_rows = conn.execute("SELECT COUNT(*) FROM portfolio_equity").fetchone()[0]
+        conn.close()
+        assert n_rows == 1  # só o record=True acima gravou — a checagem não
+
+
+class TestRunExecutionGuardas:
+    """P1-13: run_execution.py negociava sem check_drawdown_stop, piso de
+    liquidez, budget de slots ou cap de sinais por ciclo — as quatro guardas
+    que run_paper_trading já tinha. Teste de fumaça sobre o código-fonte
+    (main() é um comando click com efeitos colaterais de import pesados
+    demais pra rodar ponta a ponta em unit test)."""
+
+    SRC = (ROOT / "run_execution.py").read_text()
+
+    def test_chama_check_drawdown_stop_com_total_value(self):
+        assert "check_drawdown_stop" in self.SRC
+        assert "total_value=total_value_for_stop" in self.SRC
+
+    def test_filtra_por_liquidez_minima(self):
+        # Comportamental: reproduz a expressão de filtro do arquivo (mesma
+        # forma que run_paper_trading usa) e confirma que ela de fato corta
+        # sinais abaixo do piso — não só que a constante aparece no arquivo.
+        assert "MIN_SIGNAL_LIQUIDITY" in self.SRC
+        signals = pd.DataFrame([
+            {"question": "ilíquido", "liquidity": 100.0},
+            {"question": "líquido", "liquidity": risk_manager.MIN_SIGNAL_LIQUIDITY + 1},
+        ])
+        filtered = signals[
+            pd.to_numeric(signals["liquidity"], errors="coerce").fillna(0) >= risk_manager.MIN_SIGNAL_LIQUIDITY
+        ]
+        assert list(filtered["question"]) == ["líquido"]
+
+    def test_respeita_budget_de_slots(self):
+        assert "MAX_OPEN_POSITIONS" in self.SRC
+        assert "slots -= 1" in self.SRC
+
+    def test_capa_sinais_por_ciclo(self):
+        assert "MAX_SIGNALS_PER_CYCLE" in self.SRC
+        assert "signals.head(MAX_SIGNALS_PER_CYCLE)" in self.SRC
+
+    def test_stop_bloqueia_rebalance_nao_so_abertura(self):
+        # O bug original: o halt só impedia abrir posição nova, rebalance
+        # rodava sem checar nada. A guarda de stop precisa vir ANTES do
+        # bloco de rebalanceamento no arquivo.
+        i_stop = self.SRC.index("check_drawdown_stop(portfolio, DB_PATH")
+        i_rebalance = self.SRC.index("rebalance_positions(open_pos_mtm, portfolio")
+        assert i_stop < i_rebalance
+
+
+class TestPaperTraderStopAntesDoRebalance:
+    """P1-12: mesmo bug de ordem existia em run_paper_trading — rebalance
+    (que injeta mais capital em posições já perdedoras) rodava ANTES da
+    checagem de stop loss, então um halt nunca protegia o rebalance."""
+
+    SRC = (ROOT / "execution" / "paper_trader.py").read_text()
+
+    def test_stop_vem_antes_do_rebalance_no_ciclo(self):
+        i_stop = self.SRC.index("check_drawdown_stop(portfolio, DB_PATH")
+        i_rebalance = self.SRC.index("rebalance_positions(open_pos_mtm, portfolio, dry_run=dry_run)")
+        assert i_stop < i_rebalance
+
+
 class TestArbAlert:
     OPP = {
         "kind": "monotonicity", "guaranteed": True, "arb_group": "mono:0xa>0xb",

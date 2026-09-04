@@ -82,8 +82,22 @@ MAX_DIRECTIONAL_SKEW_PCT      = 0.75
 MIN_POSITIONS_FOR_SKEW_CHECK  = 5
 
 # Drawdown
-WEEKLY_STOP_PCT   = 0.10   # Halt de novas posições se perder 10% em 7 dias
-DAILY_STOP_PCT    = 0.05   # Halt diário se perder 5% no dia
+WEEKLY_STOP_PCT   = 0.10   # Halt de novas posições se perder 10% em 7 dias (P&L realizado)
+DAILY_STOP_PCT    = 0.05   # Halt diário se perder 5% no dia (P&L realizado)
+
+# P1-12: os dois stops acima só enxergam P&L REALIZADO — um portfólio pode
+# estar -40% em mark-to-market sem nenhum fechamento e o stop nunca dispara.
+# Pior: cortar uma posição perdedora MOVE o P&L pro balde realizado e pode
+# disparar o halt, enquanto segurar o perdedor mantém o halt desarmado — a
+# regra antiga premiava não cortar. Este stop usa valor total (cash + MTM)
+# contra o pico já visto (high-water mark), persistido em `portfolio_equity`.
+MAX_DRAWDOWN_FROM_PEAK_PCT = 0.20   # Halt se o valor total cair 20% do pico
+
+# P1-13: `run_execution.py` abria posição sem os mesmos filtros de
+# `run_paper_trading` — promovidos a constante pra não divergir entre os
+# dois entrypoints (ver Design principle no topo do arquivo).
+MIN_SIGNAL_LIQUIDITY = 5_000.0   # USDC — piso de liquidez pra considerar um sinal
+MAX_SIGNALS_PER_CYCLE = 30       # nº de sinais (já ordenados por edge) avaliados por ciclo
 
 # ── Arb estrutural (baskets multi-perna, trade_type="arb") ──
 # O lucro é garantido pela estrutura lógica dos mercados, não por modelo —
@@ -391,9 +405,37 @@ def check_exposure(
     return True, ""
 
 
-def check_drawdown_stop(portfolio: dict, db_path: Path) -> tuple[bool, str]:
+def check_drawdown_stop(
+    portfolio: dict,
+    db_path: Path,
+    total_value: float | None = None,
+    record: bool = False,
+) -> tuple[bool, str]:
     """
-    Verifica se o drawdown semanal/diário atingiu o stop.
+    Verifica se o drawdown atingiu o stop, em camadas independentes:
+      1. P&L realizado nos últimos 7 dias (WEEKLY_STOP_PCT)
+      2. P&L realizado hoje (DAILY_STOP_PCT)
+      3. Valor total (cash + MTM) contra o pico já visto (MAX_DRAWDOWN_FROM_PEAK_PCT)
+         — só roda se o chamador passar `total_value`; as camadas 1/2 já cobrem
+         o caso de fechamentos concretos mesmo sem isso (ver P1-12).
+
+    `record=True` grava `total_value` em `portfolio_equity` antes de comparar
+    contra o pico — só os dois pontos reais do ciclo (o gate de
+    run_paper_trading/run_execution) devem passar isso. `portfolio_risk_summary`
+    é só leitura (dashboard, sumário no terminal) e passa `record=False`: é
+    puramente informativo e não pode ele mesmo definir o pico, senão renderizar
+    o sumário no momento errado (ex: bem no topo do book) trava o pico ali pra
+    sempre. É por isso que a assinatura tem um parâmetro separado em vez de
+    inferir a partir de `total_value is not None`.
+
+    O pico NÃO decai com o tempo (é high-water mark de verdade, não uma janela
+    móvel) — perda realizada legítima (ex: uma posição resolve NO) também conta
+    e o halt fica permanente até ação manual. Isso é intencional: o objetivo é
+    sobreviver a um mau período, não continuar operando cegamente através dele
+    (ver "Design principle" no topo do arquivo). Pra destravar: apagar as linhas
+    de `portfolio_equity` do `portfolio_id` afetado, ou abrir um portfólio novo
+    (mesmo mecanismo que a auditoria de 2026-07-09 já usou pra "resetar" o
+    livro após o incidente do ws_feed).
 
     Returns:
         (deve_parar, motivo)
@@ -422,15 +464,47 @@ def check_drawdown_stop(portfolio: dict, db_path: Path) -> tuple[bool, str]:
               AND closed_at >= ?
         """, (day_ago,)).fetchone()[0] or 0.0
 
-        conn.close()
-
         initial = float(portfolio.get("initial_capital", 1000))
 
         if weekly_pnl / initial < -WEEKLY_STOP_PCT:
+            conn.close()
             return True, f"stop loss semanal ativado: P&L={weekly_pnl:+.2f} ({weekly_pnl/initial:+.1%})"
 
         if daily_pnl / initial < -DAILY_STOP_PCT:
+            conn.close()
             return True, f"stop loss diário ativado: P&L={daily_pnl:+.2f} ({daily_pnl/initial:+.1%})"
+
+        if total_value is not None:
+            portfolio_id = portfolio.get("id")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS portfolio_equity (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    portfolio_id INTEGER NOT NULL,
+                    ts           TEXT    NOT NULL DEFAULT (datetime('now')),
+                    total_value  REAL    NOT NULL
+                )
+            """)
+            if record:
+                conn.execute(
+                    "INSERT INTO portfolio_equity (portfolio_id, total_value) VALUES (?, ?)",
+                    (portfolio_id, total_value),
+                )
+                conn.commit()
+
+            peak = conn.execute(
+                "SELECT MAX(total_value) FROM portfolio_equity WHERE portfolio_id = ?",
+                (portfolio_id,),
+            ).fetchone()[0] or total_value
+
+            drawdown = (peak - total_value) / peak if peak > 0 else 0.0
+            if drawdown > MAX_DRAWDOWN_FROM_PEAK_PCT:
+                conn.close()
+                return True, (
+                    f"stop loss por drawdown do pico ativado: valor=${total_value:,.2f} "
+                    f"pico=${peak:,.2f} ({-drawdown:+.1%})"
+                )
+
+        conn.close()
 
     except Exception as e:
         logger.warning(f"Erro ao verificar drawdown: {e}")
@@ -948,7 +1022,7 @@ def portfolio_risk_summary(
     except Exception:
         realized_pnl = 0.0
 
-    stop_triggered, stop_reason = check_drawdown_stop(portfolio, db_path)
+    stop_triggered, stop_reason = check_drawdown_stop(portfolio, db_path, total_value=cash + pos_value)
 
     return {
         "initial_capital":    initial,
