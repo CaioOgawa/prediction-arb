@@ -362,6 +362,66 @@ class TestDoubleCredit:
         assert _cash(trading_db) == cash1
 
 
+class TestExitPriceGuards:
+    """
+    P1-14: early_exit_positions não tinha guarda de spread nem de liquidez —
+    o ws_feed foi endurecido após o incidente de 2026-05 (51 posições a 0.001),
+    mas esse caminho paralelo continuou aberto. 47 posições no DB com
+    exit_price <= 0.0015 até este fix. Posição de teste: BUY_YES, entry=0.10,
+    shares=10, custo=$1.0, trade_type='value' (min_hold 4h, aberta há meses).
+    """
+
+    def test_book_largo_nunca_dispara_exit_mesmo_com_preco_de_stop(self, trading_db):
+        # bestBid=0.02 sozinho dispararia stop_loss (valor $0.20 <= 50% do custo),
+        # mas spread=0.18 > MAX_EXIT_SPREAD=0.10 — book não é confiável.
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "bestBid": 0.02, "bestAsk": 0.20, "liquidity": 10_000.0,
+        }])
+        assert risk_manager.early_exit_positions(open_pos, mkt, trading_db) == []
+
+    def test_liquidez_insuficiente_nunca_dispara_exit(self, trading_db):
+        # Book estreito e preço de stop, mas liquidez abaixo do piso executável.
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "bestBid": 0.02, "bestAsk": 0.03, "liquidity": 100.0,
+        }])
+        assert risk_manager.early_exit_positions(open_pos, mkt, trading_db) == []
+
+    def test_book_valido_sai_no_bid_sem_desconto_duplo(self, trading_db):
+        # value=0.30×10=3.0 ≥ 2.5×custo(1.0) → profit_target. exit_price deve
+        # ser exatamente bestBid — não (bid+ask)/2 nem bid-spread/2.
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "bestBid": 0.30, "bestAsk": 0.32, "liquidity": 10_000.0,
+        }])
+        exits = risk_manager.early_exit_positions(open_pos, mkt, trading_db)
+        assert len(exits) == 1
+        assert exits[0]["exit_price"] == 0.30
+
+    def test_edge_flip_funciona_com_bid_ask_real(self, trading_db):
+        # Posição própria: BUY_YES momentum, entry_yes=0.50, flip_delta=0.12 →
+        # threshold=0.38. mid=(0.30+0.34)/2=0.32 < 0.38 → edge_flip_yes.
+        # current_value=$3.0, fora das faixas de stop_loss ($2.5) e profit ($7.5).
+        conn = sqlite3.connect(trading_db)
+        conn.execute("""
+            INSERT INTO positions
+              (condition_id, question, direction, entry_price, shares, cost_usdc,
+               status, trade_type, opened_at)
+            VALUES ('0xbbb', 'Momentum?', 'BUY_YES', 0.50, 10.0, 5.0,
+                    'open', 'momentum', '2026-01-01 00:00:00')
+        """)
+        conn.commit(); conn.close()
+        open_pos = _open_positions_df(trading_db)
+        open_pos = open_pos[open_pos["condition_id"] == "0xbbb"]
+        mkt = pd.DataFrame([{
+            "conditionId": "0xbbb", "bestBid": 0.30, "bestAsk": 0.34, "liquidity": 10_000.0,
+        }])
+        exits = risk_manager.early_exit_positions(open_pos, mkt, trading_db)
+        assert len(exits) == 1
+        assert exits[0]["trigger"].startswith("edge_flip_yes")
+
+
 class TestResolveThresholdNaoEhPreco:
     """
     P0-3: preço de mercado != resolução. RESOLVE_THRESHOLD=0.95 fechava posições
@@ -404,6 +464,20 @@ class TestResolveThresholdNaoEhPreco:
         }])
         resolved = risk_manager.resolve_positions(open_pos, mkt, trading_db)
         assert len(resolved) == 1
+        assert resolved[0]["exit_price"] == 1.0
+
+    def test_closed_com_preco_nao_extremo_resolve_pelo_lado_vencedor(self, trading_db):
+        # closed=True mas outcomePrices ainda não pinou em 0/1 exato (comum sob
+        # disputa/settlement da UMA) — o piso de 0.999 do path por vencimento NÃO
+        # pode vazar para cá, senão isto cai no ramo "expired" (P1-16) e devolve
+        # o custo integral em vez de resolver pelo lado vencedor.
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "closed": True,
+            "outcomePrices": '["0.98", "0.02"]',
+        }])
+        resolved = risk_manager.resolve_positions(open_pos, mkt, trading_db)
+        assert resolved[0]["status"] == "closed"
         assert resolved[0]["exit_price"] == 1.0
 
     def test_preco_0_95_nao_basta_mais(self, trading_db):

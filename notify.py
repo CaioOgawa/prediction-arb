@@ -48,7 +48,10 @@ def _send(text: str) -> bool:
             return False
         return True
     except Exception as e:
-        logger.warning(f"Telegram falhou: {e}")
+        # P0-7/P2-42: o repr de exceções do requests (ConnectionError, Timeout)
+        # inclui a URL completa da chamada — ou seja, o bot token — e este log
+        # roda em modo 0644. Logar só o tipo evita vazar o token no arquivo.
+        logger.warning(f"Telegram falhou: {type(e).__name__}")
         return False
 
 

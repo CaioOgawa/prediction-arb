@@ -113,6 +113,13 @@ EARLY_EXIT_DEFAULT = {
 # pode executar a posição (incidente 2026-05: 51 posições mortas a 0.001 por isso).
 POSITION_STOP_LOSS = 0.50
 
+# P1-14: mesmas guardas que o ws_feed já aplica (pipeline/ws_feed.py:74-77) —
+# book vazio/unilateral não é preço executável. early_exit_positions não tinha
+# nenhuma das duas até 2026-09-04 (47 posições no DB com exit_price <= 0.0015,
+# incidente de 2026-05, caminho que continuava aberto aqui).
+MAX_EXIT_SPREAD    = 0.10   # spread acima disso = book ilíquido/cruzado, não dispara exit
+MIN_EXIT_LIQUIDITY = 500.0  # USDC — mesmo piso do MIN_LIQUIDITY_MTM em paper_trader.py
+
 # Confiança mínima por fonte
 MIN_CONFIDENCE = {
     "odds":    0.15,   # Odds Pinnacle são confiáveis mesmo com conf baixa
@@ -382,12 +389,15 @@ def resolve_positions(
     if open_positions.empty or current_markets.empty:
         return []
 
-    # P0-3: preço de mercado NÃO é resolução. Um YES a 0.03 é só "quase todo mundo
-    # acha que não" — não significa que o evento já aconteceu. Tratar isso como
-    # resolução fechava posições vivas a -100% meses antes do vencimento (posição
-    # ETH-$10k resolvida "NO" 31min após abertura, vencimento em dezembro).
-    # Preço extremo só conta como resolução quando o mercado TAMBÉM já venceu.
-    RESOLVE_PRICE_THRESHOLD = 0.999
+    # P0-3: preço de mercado sozinho NÃO é resolução. Um YES a 0.03 é só "quase
+    # todo mundo acha que não" — não significa que o evento já aconteceu. Tratar
+    # isso como resolução fechava posições vivas a -100% meses antes do
+    # vencimento (posição ETH-$10k resolvida "NO" 31min após abertura, vencimento
+    # em dezembro). Preço só decide sozinho quando o mercado TAMBÉM já venceu, e
+    # aí o piso é mais alto (0.999) — quando `closed=True` já veio da API, o preço
+    # só desempata entre YES/NO e o piso mais folgado (0.95) de antes é seguro.
+    RESOLVE_PRICE_THRESHOLD_CLOSED    = 0.95
+    RESOLVE_PRICE_THRESHOLD_BY_EXPIRY = 0.999
 
     # Indexa mercados pelo conditionId
     mkt_index = current_markets.drop_duplicates("conditionId").set_index("conditionId")
@@ -415,11 +425,13 @@ def resolve_positions(
             prices = _parse_outcome_prices(outcome_raw)
 
             outcome = None  # 1 = YES ganhou, 0 = NO ganhou
-            if prices is not None and (is_closed or past_end_date):
+            thresh = RESOLVE_PRICE_THRESHOLD_CLOSED if is_closed \
+                else (RESOLVE_PRICE_THRESHOLD_BY_EXPIRY if past_end_date else None)
+            if prices is not None and thresh is not None:
                 p_yes, p_no = prices
-                if p_yes >= RESOLVE_PRICE_THRESHOLD:
+                if p_yes >= thresh:
                     outcome = 1
-                elif p_no >= RESOLVE_PRICE_THRESHOLD:
+                elif p_no >= thresh:
                     outcome = 0
 
             if not is_closed and outcome is None:
@@ -615,10 +627,14 @@ def early_exit_positions(
     if open_positions.empty or current_markets.empty:
         return []
 
-    # Indexa preços atuais por conditionId
+    # Indexa preços atuais por conditionId. bestBid/bestAsk/liquidity só entram
+    # quando o snapshot os tem (compat com fixtures de teste que só trazem
+    # yes_price/spread) — ver guardas de book abaixo.
+    _price_cols = [c for c in ("yes_price", "spread", "bestBid", "bestAsk", "liquidity")
+                   if c in current_markets.columns]
     mkt_prices = (
         current_markets.drop_duplicates("conditionId", keep="last")
-        .set_index("conditionId")[["yes_price", "spread"]]
+        .set_index("conditionId")[_price_cols]
         .to_dict(orient="index")
     )
 
@@ -654,18 +670,49 @@ def early_exit_positions(
                 except Exception:
                     pass
 
-            yes_price   = float(info.get("yes_price") or 0.5)
-            spread      = max(float(info.get("spread") or 0), 0.005)
             direction   = pos["direction"]
             entry_price = float(pos["entry_price"])
             shares      = float(pos["shares"])
             cost_usdc   = float(pos["cost_usdc"])
 
-            # Preço de saída (bid com spread)
-            if direction == "BUY_YES":
-                exit_price = max(yes_price - spread / 2, 0.001)
+            best_bid  = info.get("bestBid")
+            best_ask  = info.get("bestAsk")
+            liquidity = info.get("liquidity")
+
+            if best_bid is not None and best_ask is not None \
+                    and pd.notna(best_bid) and pd.notna(best_ask):
+                # P1-14: book real disponível — mesma guarda e fórmula do ws_feed
+                # (pipeline/ws_feed.py:258-267). Vender a mercado executa no bid;
+                # `bid - spread/2` (fórmula antiga) descontava o spread duas vezes.
+                book_spread = float(best_ask) - float(best_bid)
+                if book_spread <= 0 or book_spread > MAX_EXIT_SPREAD:
+                    continue  # book cruzado ou vazio — sem preço confiável
+                if liquidity is not None and pd.notna(liquidity) \
+                        and float(liquidity) < MIN_EXIT_LIQUIDITY:
+                    continue  # liquidez insuficiente — preço não é executável
+                # yes_price (mid) alimenta o edge_flip abaixo; exit_price (execução)
+                # usa bid/ask diretamente — os dois divergem por design.
+                yes_price = (float(best_bid) + float(best_ask)) / 2
+                if direction == "BUY_YES":
+                    exit_price = max(float(best_bid), 0.001)
+                else:
+                    exit_price = max(1.0 - float(best_ask), 0.001)
             else:
-                exit_price = max((1.0 - yes_price) - spread / 2, 0.001)
+                # Fallback legado (snapshot sem bestBid/bestAsk): mantém a
+                # guarda de spread mínima, mas sem book real não há como saber
+                # se é liquidez de verdade — só bloqueia o pior caso (book largo).
+                yes_price = info.get("yes_price")
+                if yes_price is None or pd.isna(yes_price):
+                    continue
+                spread = float(info.get("spread") or 0)
+                if spread > MAX_EXIT_SPREAD:
+                    continue
+                spread = max(spread, 0.005)
+                yes_price = float(yes_price)
+                if direction == "BUY_YES":
+                    exit_price = max(yes_price - spread / 2, 0.001)
+                else:
+                    exit_price = max((1.0 - yes_price) - spread / 2, 0.001)
 
             current_value = exit_price * shares
             pnl_usdc      = round((exit_price - entry_price) * shares, 2)
