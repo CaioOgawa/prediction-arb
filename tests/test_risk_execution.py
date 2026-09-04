@@ -1051,6 +1051,244 @@ class TestBacktestSharpeRatio:
         assert stats["sharpe_se"] is None
 
 
+class TestWilsonInterval:
+    """P2-36: win rate de amostra pequena precisa de IC, não só do ponto
+    estimado — 1/1 = 100% e 15/20 = 75% não têm a mesma confiabilidade."""
+
+    def test_n_zero_da_nan(self):
+        lo, hi = live_backtest.wilson_interval(0, 0)
+        assert np.isnan(lo) and np.isnan(hi)
+
+    def test_intervalo_contem_a_taxa_observada(self):
+        lo, hi = live_backtest.wilson_interval(7, 10)
+        assert lo < 0.7 < hi
+
+    def test_nunca_estoura_0_1(self):
+        # A aproximação normal (p ± z√(p(1-p)/n)) estoura esses limites com
+        # p=1 ou p=0 e n pequeno — Wilson não pode.
+        lo, hi = live_backtest.wilson_interval(3, 3)
+        assert 0.0 <= lo <= hi <= 1.0
+        lo, hi = live_backtest.wilson_interval(0, 3)
+        assert 0.0 <= lo <= hi <= 1.0
+
+    def test_intervalo_encolhe_com_mais_n_pra_mesma_proporcao(self):
+        lo_pequeno, hi_pequeno = live_backtest.wilson_interval(3, 5)     # 60%, n=5
+        lo_grande,  hi_grande  = live_backtest.wilson_interval(60, 100)  # 60%, n=100
+        assert (hi_pequeno - lo_pequeno) > (hi_grande - lo_grande)
+
+
+class TestWinRateWilsonESuficiencia:
+    """P2-36: win_rate_by_source/by_trade_type ganham IC de Wilson e um flag
+    explícito de amostra insuficiente (n<20) — sem truncar linha nenhuma."""
+
+    def _closed(self, n_deribit_wins, n_deribit_losses, n_odds_wins, n_odds_losses):
+        rows = []
+        for i in range(n_deribit_wins):
+            rows.append({"pnl_usdc": 5.0, "signal_source": "deribit", "trade_type": "value"})
+        for i in range(n_deribit_losses):
+            rows.append({"pnl_usdc": -5.0, "signal_source": "deribit", "trade_type": "value"})
+        for i in range(n_odds_wins):
+            rows.append({"pnl_usdc": 3.0, "signal_source": "odds", "trade_type": "momentum"})
+        for i in range(n_odds_losses):
+            rows.append({"pnl_usdc": -3.0, "signal_source": "odds", "trade_type": "momentum"})
+        return pd.DataFrame(rows)
+
+    def test_grupo_com_menos_de_20_marca_insuficiente(self):
+        closed = self._closed(5, 5, 12, 8)  # deribit n=10, odds n=20
+        wr = live_backtest.win_rate_by_source(closed)
+        deribit = wr[wr["signal_source"] == "deribit"].iloc[0]
+        odds = wr[wr["signal_source"] == "odds"].iloc[0]
+        assert deribit["sufficient_n"] == False
+        assert odds["sufficient_n"] == True
+
+    def test_colunas_wilson_presentes_e_ordenadas(self):
+        closed = self._closed(5, 5, 12, 8)
+        wr = live_backtest.win_rate_by_source(closed)
+        for _, row in wr.iterrows():
+            assert row["wilson_lo"] <= row["win_rate"] <= row["wilson_hi"]
+
+    def test_vazio_preserva_colunas_novas(self):
+        wr = live_backtest.win_rate_by_source(pd.DataFrame())
+        assert list(wr.columns) == [
+            "signal_source", "n_trades", "n_wins", "win_rate", "avg_pnl",
+            "total_pnl", "wilson_lo", "wilson_hi", "sufficient_n",
+        ]
+
+    def test_by_trade_type_mesma_coisa(self):
+        closed = self._closed(5, 5, 12, 8)
+        wr = live_backtest.win_rate_by_trade_type(closed)
+        value = wr[wr["trade_type"] == "value"].iloc[0]
+        momentum = wr[wr["trade_type"] == "momentum"].iloc[0]
+        assert value["sufficient_n"] == False   # n=10
+        assert momentum["sufficient_n"] == True  # n=20
+
+    def test_suppress_apaga_win_rate_pontual_nao_so_decora(self):
+        # A auditoria pede supressão, não uma ressalva ao lado do número
+        # enganoso — n<20 não pode continuar mostrando "100.0%" pra ninguém.
+        closed = self._closed(3, 0, 12, 8)  # deribit n=3 (100%), odds n=20
+        wr = live_backtest.win_rate_by_source(closed)
+        suppressed = live_backtest.suppress_insufficient_win_rate(wr)
+        deribit = suppressed[suppressed["signal_source"] == "deribit"].iloc[0]
+        odds = suppressed[suppressed["signal_source"] == "odds"].iloc[0]
+        assert pd.isna(deribit["win_rate"])       # n=3: suprimido
+        assert not pd.isna(odds["win_rate"])      # n=20: preservado
+        assert deribit["n_trades"] == 3           # n/wins continuam visíveis
+        assert deribit["n_wins"] == 3
+
+
+class TestEdgeCalibrationEConfidenceAccuracySuficiencia:
+    """P2-36: edge_calibration/confidence_accuracy também ganham sufficient_n
+    — a auditoria aponta ~9 pontos por bin em 44 trades totais, bem abaixo
+    de qualquer limiar razoável."""
+
+    def test_edge_calibration_marca_bin_pequeno(self):
+        # Dois valores distintos de edge — bin real do pd.cut, não o caso
+        # degenerado de bins=1 sobre um único valor (que passa por acidente
+        # da forma como pd.cut expande um range de largura zero).
+        closed = pd.DataFrame(
+            [{"pnl_usdc": 1.0, "cost_usdc": 10.0, "edge_at_entry": 0.05} for _ in range(2)] +
+            [{"pnl_usdc": 1.0, "cost_usdc": 10.0, "edge_at_entry": 0.15} for _ in range(1)]
+        )
+        cal = live_backtest.edge_calibration(closed, n_bins=2)
+        assert (cal.loc[cal["n"] > 0, "sufficient_n"] == False).all()
+
+    def test_confidence_accuracy_tem_wilson_e_flag(self):
+        closed = pd.DataFrame(
+            [{"pnl_usdc": 1.0, "confidence": 0.7} for _ in range(3)] +
+            [{"pnl_usdc": -1.0, "confidence": 0.7} for _ in range(2)]
+        )
+        acc = live_backtest.confidence_accuracy(closed, n_bins=1)
+        row = acc.iloc[0]
+        assert row["n"] == 5
+        assert row["sufficient_n"] == False
+        assert row["wilson_lo"] <= row["win_rate"] <= row["wilson_hi"]
+
+
+class TestSimBacktestBrierECalibSummary:
+    """P2-32: _summary() reporta Brier score e erro de calibração médio —
+    as duas métricas que não dependem de market_discount, ao contrário de
+    P&L/Sharpe/retorno."""
+
+    def _sim_com_closed(self, closed_positions):
+        sim = sim_backtest.WalkForwardSimulator(
+            sim_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            sim_end=datetime(2026, 2, 1, tzinfo=timezone.utc),
+            initial_capital=1000.0,
+        )
+        sim.closed_positions = closed_positions
+        sim.cash = 1000.0 + sum(p.pnl_usdc or 0 for p in closed_positions)
+        return sim
+
+    def _pos(self, side, entry_prob, resolved_yes, pnl=0.0):
+        return sim_backtest.SimPosition(
+            market_id="0xa", question="Q?", asset="BTC", strike=70_000.0,
+            direction="above", is_touch=True, side=side,
+            entry_ts=datetime(2026, 1, 1, tzinfo=timezone.utc), entry_prob=entry_prob,
+            entry_price=0.5, cost_usdc=50.0, shares=100.0,
+            end_date=datetime(2026, 1, 15, tzinfo=timezone.utc),
+            resolved_yes=resolved_yes, pnl_usdc=pnl, exit_reason="resolved",
+        )
+
+    def test_brier_zero_quando_modelo_acerta_com_certeza(self):
+        # BUY_YES com entry_prob=1.0, resolve YES: erro quadrático = (1-1)^2 = 0
+        sim = self._sim_com_closed([self._pos("BUY_YES", 1.0, resolved_yes=1)])
+        result = sim._summary()
+        assert result["brier_score"] == pytest.approx(0.0)
+
+    def test_brier_maximo_quando_modelo_erra_com_certeza(self):
+        # BUY_YES com entry_prob=1.0 (certeza de ganhar), mas resolve NO: (1-0)^2=1
+        sim = self._sim_com_closed([self._pos("BUY_YES", 1.0, resolved_yes=0)])
+        result = sim._summary()
+        assert result["brier_score"] == pytest.approx(1.0)
+
+    def test_none_sem_trade_com_resolucao_conhecida(self):
+        sim = self._sim_com_closed([self._pos("BUY_YES", 0.6, resolved_yes=None)])
+        result = sim._summary()
+        assert result["brier_score"] is None
+        assert result["mean_abs_calib_err"] is None
+
+    def test_mean_abs_calib_err_ponderado_por_n(self):
+        # Um bin de 60-70% com erro grande e n baixo não deve dominar sozinho
+        # um bin de 90-100% com erro pequeno e n alto — pondera por N.
+        positions = (
+            [self._pos("BUY_YES", 0.65, resolved_yes=1) for _ in range(1)] +   # bin 60-70, wr=100%, erro +35%
+            [self._pos("BUY_YES", 0.95, resolved_yes=1) for _ in range(9)]     # bin 90-100, wr=100%, erro ~+5%
+        )
+        sim = self._sim_com_closed(positions)
+        result = sim._summary()
+        # erro ponderado deve estar mais perto do erro do bin de 9 trades que do de 1
+        assert abs(result["mean_abs_calib_err"] - 0.35) > abs(result["mean_abs_calib_err"] - 0.05)
+
+
+class TestDiscountSweep:
+    """P2-32: --discount-sweep roda a mesma janela sob vários market_discount
+    pra deixar explícito que P&L sobe com o desconto por construção, não
+    porque a estratégia melhora."""
+
+    def test_roda_um_discount_por_valor_da_lista(self, monkeypatch):
+        calls = []
+
+        def fake_run(self, markets, verbose=True):
+            calls.append(self.market_discount)
+            return {
+                "n_trades": 1, "total_pnl": self.market_discount * 100,
+                "total_return_pct": self.market_discount * 10,
+                "sharpe": 1.0, "brier_score": 0.2,
+            }
+
+        monkeypatch.setattr(sim_backtest.WalkForwardSimulator, "run", fake_run)
+        rows = sim_backtest.run_discount_sweep(
+            markets=pd.DataFrame(), sim_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            sim_end=datetime(2026, 2, 1, tzinfo=timezone.utc), capital=1000.0,
+            min_conviction=0.08, profit_mult=1.5, discounts=(0.0, 0.10, 0.20),
+        )
+        assert calls == [0.0, 0.10, 0.20]
+        assert [r["market_discount"] for r in rows] == [0.0, 0.10, 0.20]
+
+    def test_pnl_monotonico_no_desconto_por_construcao(self, monkeypatch):
+        def fake_run(self, markets, verbose=True):
+            return {
+                "n_trades": 5, "total_pnl": self.market_discount * 100,
+                "total_return_pct": self.market_discount * 10,
+                "sharpe": None, "brier_score": 0.2,
+            }
+
+        monkeypatch.setattr(sim_backtest.WalkForwardSimulator, "run", fake_run)
+        rows = sim_backtest.run_discount_sweep(
+            markets=pd.DataFrame(), sim_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            sim_end=datetime(2026, 2, 1, tzinfo=timezone.utc), capital=1000.0,
+            min_conviction=0.08, profit_mult=1.5,
+        )
+        pnls = [r["total_pnl"] for r in rows]
+        assert pnls == sorted(pnls)  # monotônico crescente — é a própria definição, não um achado
+
+    def test_run_pula_fetch_quando_spot_dvol_ja_presentes(self, monkeypatch):
+        # A auditoria não pediu isso, mas sem essa guarda em WalkForwardSimulator.run
+        # o sweep faria 1 fetch de CoinGecko/Deribit por desconto testado — dado que
+        # não muda com market_discount.
+        def boom(*a, **kw):
+            raise AssertionError("não devia refazer fetch com spot/dvol já presentes")
+
+        monkeypatch.setattr(sim_backtest, "fetch_spot_daily", boom)
+        monkeypatch.setattr(sim_backtest, "fetch_dvol_daily", boom)
+
+        sim = sim_backtest.WalkForwardSimulator(
+            sim_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            sim_end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            initial_capital=1000.0,
+        )
+        sim.spot["BTC"] = pd.Series([70_000.0], index=[pd.Timestamp("2026-01-01", tz="UTC")])
+        sim.dvol["BTC"] = pd.Series([0.6], index=[pd.Timestamp("2026-01-01", tz="UTC")])
+
+        markets = pd.DataFrame([{
+            "market_id": "0xa", "asset": "BTC",
+            "end_date": datetime(2025, 12, 1, tzinfo=timezone.utc),  # já expirado, pulado no loop
+        }])
+        result = sim.run(markets, verbose=False)
+        assert result["n_trades"] == 0
+        assert list(sim.spot["BTC"]) == [70_000.0]  # não foi sobrescrito pelo fetch
+
+
 # ──────────────────────────────────────────────────────────
 # structural_arb — detectores puros (Fase 2)
 # ──────────────────────────────────────────────────────────

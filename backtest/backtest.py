@@ -34,6 +34,28 @@ DB_PATH     = Path("data/db/paper_trading.db")
 RESULTS_DIR = Path("backtest/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# P2-36: abaixo disso o IC de Wilson fica largo demais pra sustentar qualquer
+# leitura — win rate de 1/1 = 100% não significa nada.
+MIN_N_FOR_WIN_RATE = 20
+
+
+def wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """
+    Intervalo de confiança de Wilson (95% por default) pra uma taxa binomial.
+    Ao contrário da aproximação normal (± z·√(p(1−p)/n)), não estoura [0, 1]
+    com n pequeno ou p perto de 0/1 — é a forma padrão pra win rate de amostra
+    curta, que é o caso normal aqui.
+    """
+    if n == 0:
+        return (float("nan"), float("nan"))
+    phat  = wins / n
+    denom = 1 + z**2 / n
+    center = phat + z**2 / (2 * n)
+    margin = z * np.sqrt(phat * (1 - phat) / n + z**2 / (4 * n**2))
+    lo = (center - margin) / denom
+    hi = (center + margin) / denom
+    return (max(0.0, lo), min(1.0, hi))
+
 
 # ──────────────────────────────────────────────────────────
 # Leitura do banco
@@ -124,12 +146,30 @@ def pnl_curve(closed: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
+def _add_wilson_columns(stats: pd.DataFrame) -> pd.DataFrame:
+    """P2-36: adiciona IC de Wilson e flag de amostra insuficiente (n<20) a
+    qualquer tabela com colunas n_trades/n_wins. Não trunca linha nenhuma —
+    quem exibe decide se suprime, mas o rótulo vai junto do número."""
+    if stats.empty:
+        stats["wilson_lo"] = pd.Series(dtype=float)
+        stats["wilson_hi"] = pd.Series(dtype=float)
+        stats["sufficient_n"] = pd.Series(dtype=bool)
+        return stats
+    intervals = stats.apply(lambda r: wilson_interval(int(r["n_wins"]), int(r["n_trades"])), axis=1)
+    stats["wilson_lo"] = [i[0] for i in intervals]
+    stats["wilson_hi"] = [i[1] for i in intervals]
+    stats["sufficient_n"] = stats["n_trades"] >= MIN_N_FOR_WIN_RATE
+    return stats
+
+
 def win_rate_by_source(closed: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula win rate, P&L médio e total por fonte de sinal.
+    Calcula win rate, IC de Wilson e P&L médio/total por fonte de sinal.
     """
+    cols = ["signal_source", "n_trades", "n_wins", "win_rate", "avg_pnl", "total_pnl",
+            "wilson_lo", "wilson_hi", "sufficient_n"]
     if closed.empty:
-        return pd.DataFrame(columns=["signal_source", "n_trades", "n_wins", "win_rate", "avg_pnl", "total_pnl"])
+        return pd.DataFrame(columns=cols)
 
     closed = closed.copy()
     closed["won"] = closed["pnl_usdc"] > 0
@@ -145,15 +185,17 @@ def win_rate_by_source(closed: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     stats["win_rate"] = stats["n_wins"] / stats["n_trades"]
-    return stats
+    return _add_wilson_columns(stats)
 
 
 def win_rate_by_trade_type(closed: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula win rate, P&L médio e total por tipo de trade (value / momentum).
+    Calcula win rate, IC de Wilson e P&L médio/total por tipo de trade (value / momentum).
     """
+    cols = ["trade_type", "n_trades", "n_wins", "win_rate", "avg_pnl", "total_pnl",
+            "wilson_lo", "wilson_hi", "sufficient_n"]
     if closed.empty or "trade_type" not in closed.columns:
-        return pd.DataFrame(columns=["trade_type", "n_trades", "n_wins", "win_rate", "avg_pnl", "total_pnl"])
+        return pd.DataFrame(columns=cols)
 
     closed = closed.copy()
     closed["won"] = closed["pnl_usdc"] > 0
@@ -169,7 +211,7 @@ def win_rate_by_trade_type(closed: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     stats["win_rate"] = stats["n_wins"] / stats["n_trades"]
-    return stats
+    return _add_wilson_columns(stats)
 
 
 def edge_calibration(closed: pd.DataFrame, n_bins: int = 5) -> pd.DataFrame:
@@ -199,6 +241,7 @@ def edge_calibration(closed: pd.DataFrame, n_bins: int = 5) -> pd.DataFrame:
         .reset_index()
     )
     cal["edge_bin"] = cal["edge_bin"].astype(str)
+    cal["sufficient_n"] = cal["n"] >= MIN_N_FOR_WIN_RATE
     return cal
 
 
@@ -221,12 +264,17 @@ def confidence_accuracy(closed: pd.DataFrame, n_bins: int = 4) -> pd.DataFrame:
         df.groupby("conf_bin", observed=False)
         .agg(
             n        = ("won", "count"),
+            n_wins   = ("won", "sum"),
             avg_conf = ("confidence", "mean"),
             win_rate = ("won", "mean"),
         )
         .reset_index()
     )
     acc["conf_bin"] = acc["conf_bin"].astype(str)
+    intervals = acc.apply(lambda r: wilson_interval(int(r["n_wins"]), int(r["n"])), axis=1)
+    acc["wilson_lo"] = [i[0] for i in intervals]
+    acc["wilson_hi"] = [i[1] for i in intervals]
+    acc["sufficient_n"] = acc["n"] >= MIN_N_FOR_WIN_RATE
     return acc
 
 
@@ -367,6 +415,19 @@ def summary_stats(
 # Relatório HTML
 # ──────────────────────────────────────────────────────────
 
+def suppress_insufficient_win_rate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    P2-36: apaga o win_rate pontual (não só decora) onde sufficient_n é False
+    — n_trades/n_wins/wilson_lo/wilson_hi continuam intactos, só a % que
+    mais engana com amostra curta some, virando NaN pra quem for exibir.
+    """
+    if df.empty or "sufficient_n" not in df.columns:
+        return df
+    df = df.copy()
+    df.loc[~df["sufficient_n"], "win_rate"] = np.nan
+    return df
+
+
 def _df_to_html_table(df: pd.DataFrame, fmt: dict | None = None) -> str:
     """Converte DataFrame para HTML table com classes de estilo."""
     if df.empty:
@@ -419,6 +480,12 @@ def generate_html_report(
     conf_acc = confidence_accuracy(closed)
     curve    = pnl_curve(closed)
 
+    # P2-36: suprimida uma vez, usada em toda parte que exibe win_rate
+    # (tabela e gráfico) — sem isso o gráfico plotly vazava a % enganosa
+    # mesmo com a tabela já suprimindo.
+    wr_src_disp = suppress_insufficient_win_rate(wr_src)
+    wr_tt_disp  = suppress_insufficient_win_rate(wr_tt)
+
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     # ── Plotly charts ──────────────────────────────────────
@@ -446,13 +513,20 @@ def generate_html_report(
         )
         pnl_chart_html = pio.to_html(fig, full_html=False, include_plotlyjs=False)
 
-    if HAS_PLOTLY and not wr_src.empty:
+    if HAS_PLOTLY and not wr_src_disp.empty:
+        # P2-36: barra sem win_rate (n<20) fica sem altura, com "n<20" escrito
+        # em cima em vez de mostrar a % suprimida.
+        bar_y = (wr_src_disp["win_rate"] * 100).round(1)
+        bar_text = [
+            "n<20" if pd.isna(v) else f"{v}%"
+            for v in bar_y
+        ]
         fig2 = go.Figure(go.Bar(
-            x=wr_src["signal_source"],
-            y=(wr_src["win_rate"] * 100).round(1),
-            text=(wr_src["win_rate"] * 100).round(1).astype(str) + "%",
+            x=wr_src_disp["signal_source"],
+            y=bar_y.fillna(0),
+            text=bar_text,
             textposition="outside",
-            marker_color=["#00d4aa", "#ff6b6b", "#ffd93d"][:len(wr_src)],
+            marker_color=["#00d4aa", "#ff6b6b", "#ffd93d"][:len(wr_src_disp)],
         ))
         fig2.update_layout(
             title="Win Rate por Fonte de Sinal",
@@ -518,11 +592,19 @@ def generate_html_report(
 
     # ── Win rate table ─────────────────────────────────────
     wr_fmt = {
-        "win_rate":  lambda v: f"{v:.1%}",
-        "avg_pnl":   lambda v: f"${v:+.2f}",
-        "total_pnl": lambda v: f'<span style="color:{"#00d4aa" if v >= 0 else "#ff6b6b"}">${v:+.2f}</span>',
+        "win_rate":     lambda v: f"{v:.1%}" if v == v else "n<20",
+        "wilson_lo":    lambda v: f"{v:.0%}" if v == v else "—",
+        "wilson_hi":    lambda v: f"{v:.0%}" if v == v else "—",
+        "sufficient_n": lambda v: "✓" if v else '<span style="color:#ffd93d">⚠</span>',
+        "avg_pnl":      lambda v: f"${v:+.2f}",
+        "total_pnl":    lambda v: f'<span style="color:{"#00d4aa" if v >= 0 else "#ff6b6b"}">${v:+.2f}</span>',
     }
-    wr_table = _df_to_html_table(wr_src, fmt=wr_fmt)
+    wr_table = _df_to_html_table(wr_src_disp, fmt=wr_fmt)
+    n_comparisons_html = len(wr_src) + len(wr_tt)
+    if not edge_cal.empty:
+        n_comparisons_html += int((edge_cal["n"] > 0).sum())
+    if not conf_acc.empty:
+        n_comparisons_html += int((conf_acc["n"] > 0).sum())
 
     # ── Stats cards ────────────────────────────────────────
     def card(label: str, value: str, color: str = "#e9ecef") -> str:
@@ -572,6 +654,8 @@ def generate_html_report(
     tr:hover td {{ background: #161b22; }}
     .chart-section {{ margin-bottom: 24px; }}
     .no-data {{ color: #6c757d; font-style: italic; padding: 12px 0; }}
+    .warn {{ color: #ffd93d; font-size: 0.8rem; background: #1a1600; border: 1px solid #ffd93d33;
+             padding: 8px 14px; border-radius: 6px; margin: 12px 0 20px; }}
   </style>
 </head>
 <body>
@@ -590,11 +674,13 @@ def generate_html_report(
   {wr_table}
 
   <h2>Win Rate por Trade Type</h2>
-  {_df_to_html_table(wr_tt, fmt={
-      "win_rate":  lambda v: f"{v:.1%}",
-      "avg_pnl":   lambda v: f"${v:+.2f}",
-      "total_pnl": lambda v: f'<span style="color:{"#00d4aa" if v >= 0 else "#ff6b6b"}">${v:+.2f}</span>',
-  })}
+  {_df_to_html_table(wr_tt_disp, fmt=wr_fmt)}
+
+  <p class="warn">
+    ⚠ P2-36: {n_comparisons_html} grupos/bins comparados nesta página, sem correção de
+    múltiplos testes — leia qualquer efeito isolado como exploratório. Linhas com
+    "⚠ n&lt;20" têm intervalo de Wilson largo demais pra sustentar leitura sozinhas.
+  </p>
 
   <div class="chart-section">{charts_html}</div>
 
@@ -663,19 +749,29 @@ def print_backtest_summary(
     if stats["max_drawdown_usdc"] < 0:
         console.print(f"  Max drawdown:     [red]${stats['max_drawdown_usdc']:>+.2f}[/red]")
 
+    n_comparisons = 0
+
     # Win rate by source
     wr_src = win_rate_by_source(closed)
     if not wr_src.empty:
+        n_comparisons += len(wr_src)
         console.print("\n[bold]── Win Rate por Fonte ───────────────────────────[/bold]")
         tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
         tbl.add_column("Fonte",        style="cyan")
         tbl.add_column("Trades",       justify="right")
         tbl.add_column("Wins",         justify="right")
         tbl.add_column("Win Rate",     justify="right")
+        tbl.add_column("IC 95% (Wilson)", justify="right")
         tbl.add_column("Avg P&L",      justify="right")
         tbl.add_column("Total P&L",    justify="right")
         for _, row in wr_src.iterrows():
-            wr_str    = f"{row['win_rate']:.1%}"
+            suff = bool(row["sufficient_n"])
+            if suff:
+                wr_color = "green" if row["win_rate"] >= 0.5 else "yellow"
+                wr_str   = f"[{wr_color}]{row['win_rate']:.1%}[/{wr_color}]"
+            else:
+                wr_str = "[dim]n<20[/dim]"
+            ci_str   = f"{row['wilson_lo']:.0%}–{row['wilson_hi']:.0%}"
             avg_color = "green" if row["avg_pnl"] >= 0 else "red"
             tot_color = "green" if row["total_pnl"] >= 0 else "red"
             tbl.add_row(
@@ -683,6 +779,7 @@ def print_backtest_summary(
                 str(int(row["n_trades"])),
                 str(int(row["n_wins"])),
                 wr_str,
+                ci_str,
                 f"[{avg_color}]${row['avg_pnl']:+.2f}[/{avg_color}]",
                 f"[{tot_color}]${row['total_pnl']:+.2f}[/{tot_color}]",
             )
@@ -691,16 +788,24 @@ def print_backtest_summary(
     # Win rate by trade_type
     wr_tt = win_rate_by_trade_type(closed)
     if not wr_tt.empty:
+        n_comparisons += len(wr_tt)
         console.print("\n[bold]── Win Rate por Trade Type ──────────────────────[/bold]")
         tbl_tt = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
         tbl_tt.add_column("Trade Type",   style="cyan")
         tbl_tt.add_column("Trades",       justify="right")
         tbl_tt.add_column("Wins",         justify="right")
         tbl_tt.add_column("Win Rate",     justify="right")
+        tbl_tt.add_column("IC 95% (Wilson)", justify="right")
         tbl_tt.add_column("Avg P&L",      justify="right")
         tbl_tt.add_column("Total P&L",    justify="right")
         for _, row in wr_tt.iterrows():
-            wr_str    = f"{row['win_rate']:.1%}"
+            suff = bool(row["sufficient_n"])
+            if suff:
+                wr_color = "green" if row["win_rate"] >= 0.5 else "yellow"
+                wr_str   = f"[{wr_color}]{row['win_rate']:.1%}[/{wr_color}]"
+            else:
+                wr_str = "[dim]n<20[/dim]"
+            ci_str   = f"{row['wilson_lo']:.0%}–{row['wilson_hi']:.0%}"
             avg_color = "green" if row["avg_pnl"] >= 0 else "red"
             tot_color = "green" if row["total_pnl"] >= 0 else "red"
             tbl_tt.add_row(
@@ -708,6 +813,7 @@ def print_backtest_summary(
                 str(int(row["n_trades"])),
                 str(int(row["n_wins"])),
                 wr_str,
+                ci_str,
                 f"[{avg_color}]${row['avg_pnl']:+.2f}[/{avg_color}]",
                 f"[{tot_color}]${row['total_pnl']:+.2f}[/{tot_color}]",
             )
@@ -716,6 +822,8 @@ def print_backtest_summary(
     # Edge calibration (only if enough data)
     cal = edge_calibration(closed)
     if not cal.empty and cal["n"].sum() >= 5:
+        n_bins_shown = int((cal["n"] > 0).sum())
+        n_comparisons += n_bins_shown
         console.print("[bold]── Calibração de Edge ───────────────────────────[/bold]")
         tbl2 = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
         tbl2.add_column("Bin de Edge",      style="dim")
@@ -727,12 +835,24 @@ def print_backtest_summary(
                 continue
             diff = row["avg_return"] - row["avg_edge"]
             diff_color = "green" if diff >= 0 else "red"
+            n_str = str(int(row["n"])) if row["sufficient_n"] else f"[dim]{int(row['n'])} ⚠[/dim]"
             tbl2.add_row(
                 str(row["edge_bin"]),
-                str(int(row["n"])),
+                n_str,
                 f"{row['avg_edge']:.3f}",
                 f"[{diff_color}]{row['avg_return']:.3f}[/{diff_color}]",
             )
         console.print(tbl2)
     elif closed.empty:
         console.print("\n[dim]Aguardando posições fechadas para métricas detalhadas.[/dim]")
+
+    conf_acc = confidence_accuracy(closed)
+    if not conf_acc.empty:
+        n_comparisons += int((conf_acc["n"] > 0).sum())
+
+    if n_comparisons > 0:
+        console.print(
+            f"\n[dim]P2-36: {n_comparisons} grupos/bins comparados nesta rodada, sem correção "
+            "de múltiplos testes — trate qualquer efeito isolado como exploratório, não "
+            "confirmatório. Linhas com ⚠ n<20 têm IC de Wilson largo demais pra sustentar leitura.[/dim]"
+        )

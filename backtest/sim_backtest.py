@@ -14,32 +14,49 @@ histórica observada do Polymarket.
 
   --market-discount 0.00 → sem edge (fair price = BS_prob). Resultado: 0 trades
                             porque Kelly = 0 quando entry_price = fair_value.
-  --market-discount 0.15 → Polymarket precificou 15% abaixo do BS_prob com drift.
-                            Calibrado empiricamente: touch markets BTC/ETH tendem
-                            a ser subprecificados em 15-25% pela medida real vs
-                            risk-neutral (mercado ignora o drift de longo prazo).
-  --market-discount 0.25 → cenário conservador de maior ineficiência.
+  --market-discount 0.15-0.25 → cenário de ineficiência assumida, ESCOLHIDO,
+                            não medido — não há citação nem dado que sustente
+                            um número específico aqui (P2-32). Como
+                            entry_price = BS_prob × (1 − desconto), edge =
+                            desconto × BS_prob por construção: qualquer
+                            desconto > 0 garante EV positivo simulado, sempre
+                            a favor. O simulador não consegue produzir P&L
+                            negativo nesse regime, nem tem como distinguir
+                            "modelo bom" de "desconto generoso". Rode
+                            `--discount-sweep` pra ver os dois números
+                            (P&L, Sharpe) subirem junto com o parâmetro, e
+                            compare com o Brier score / erro de calibração
+                            (esses dois não mudam com o desconto — são a
+                            parte deste simulador que mede alguma coisa real).
 
-O que se testa com isso:
-  1. Calibração: win_rate vs. convicção prevista
-  2. Kelly sizing: adequação do tamanho dado o desconto
-  3. Early exits: profit targets / edge flips melhoram Sharpe?
-  4. Sensibilidade: como o P&L muda com o desconto assumido?
+O que se testa com isso (P2-32 reenquadrou pra deixar isso honesto):
+  1. Calibração: BS_prob prevista vs. resultado real (Brier score, erro por
+     faixa) — o único resultado deste simulador que não depende do desconto.
+  2. Kelly sizing: adequação do tamanho dado o desconto assumido.
+  3. Early exits: profit targets / edge flips mudam o mix de saídas.
+  4. Sensibilidade ao desconto: `--discount-sweep` — não é uma pergunta em
+     aberto, é a demonstração de que P&L/Sharpe são função do parâmetro.
 
 Dados utilizados:
   - Spot BTC/ETH: CoinGecko API — diário (1d), até 365 dias
   - Volatilidade implícita: Deribit DVOL — diário (1d), até 365 dias
-  - Mercados: raw markets parquet (primeiro arquivo em data/raw/markets/)
-    → inclui mercados BTC/ETH de 2025 com resultado conhecido (outcomePrices)
+  - Mercados: markets_all_*.parquet mais ANTIGO em data/raw/markets/ (por
+    mtime, não ordem alfabética — P2-34) → mercados BTC/ETH com resultado
+    conhecido (outcomePrices)
 
-Janela típica de simulação:
-  - ~April 2025 → December 31, 2025  (mercados EOY 2025 resolvidos)
-  - Passo: 1 dia (limitado pela granularidade do DVOL)
+Janela de simulação: depende do que sobrar em disco. A retenção de
+db_maintenance.py (P2-37) apagava markets_all_* mais velho que 14 dias antes
+de excluir esse padrão do escopo dela (2026-09-04) — o histórico original de
+~abril a dezembro de 2025 foi perdido nesse incidente e não há como recuperá-lo
+localmente. Na data do incidente, o snapshot mais antigo restante em disco era
+de ~21 de agosto de 2026 — checar `data/raw/markets/` pra saber o que há hoje.
+Passo: 1 dia (limitado pela granularidade do DVOL).
 
 Uso:
   uv run python backtest/sim_backtest.py
   uv run python backtest/sim_backtest.py --days 200 --min-conviction 0.08
   uv run python backtest/sim_backtest.py --html
+  uv run python backtest/sim_backtest.py --discount-sweep
 """
 
 import json
@@ -629,9 +646,13 @@ class WalkForwardSimulator:
         # Identifica ativos necessários
         assets = markets["asset"].unique().tolist()
 
-        # Busca dados históricos
+        # Busca dados históricos — pula ativo já presente em self.spot/self.dvol
+        # (run_discount_sweep pré-popula os dois pra não refazer 1 fetch de
+        # CoinGecko/Deribit por desconto testado, quando um basta).
         days = max(366, int((self.sim_end - self.sim_start).days) + 30)
         for asset in assets:
+            if asset in self.spot and asset in self.dvol:
+                continue
             try:
                 self.spot[asset] = fetch_spot_daily(asset, days=min(days, 365))
                 self.dvol[asset] = fetch_dvol_daily(asset, days=min(days, 365))
@@ -770,6 +791,28 @@ class WalkForwardSimulator:
                         "calib_err":  round(wins_b / n_b - avg_prob, 3),
                     })
 
+        # P2-32: Brier score e erro de calibração médio, não os bins por faixa
+        # — isso é o que este simulador consegue de fato falsear (o desconto
+        # de mercado não entra em nenhum dos dois). market_discount desloca
+        # entry_price, não entry_prob nem resolved_yes.
+        brier_score = None
+        mean_abs_calib_err = None
+        if closed_with_outcome:
+            brier_terms = []
+            for p in closed_with_outcome:
+                model_prob = p.entry_prob if p.side == "BUY_YES" else 1 - p.entry_prob
+                won = 1 if (
+                    (p.resolved_yes == 1 and p.side == "BUY_YES") or
+                    (p.resolved_yes == 0 and p.side == "BUY_NO")
+                ) else 0
+                brier_terms.append((model_prob - won) ** 2)
+            brier_score = round(sum(brier_terms) / len(brier_terms), 4)
+        if calibration:
+            total_n = sum(b["n"] for b in calibration)
+            mean_abs_calib_err = round(
+                sum(abs(b["calib_err"]) * b["n"] for b in calibration) / total_n, 4
+            )
+
         return {
             "sim_start":        self.sim_start.date().isoformat(),
             "sim_end":          self.sim_end.date().isoformat(),
@@ -785,6 +828,8 @@ class WalkForwardSimulator:
             "max_drawdown_pct": round(max_dd * 100, 2),
             "exit_reasons":     exit_reasons,
             "calibration":      calibration,
+            "brier_score":      brier_score,
+            "mean_abs_calib_err": mean_abs_calib_err,
             "positions":        closed,
             "pnl_curve":        pd.DataFrame(self.pnl_curve),
         }
@@ -805,6 +850,59 @@ def print_sim_summary(result: dict) -> None:
     console.print(f"  Período: {result['sim_start']} → {result['sim_end']}")
     console.print(f"  Capital inicial:  ${result['initial_capital']:,.2f}")
 
+    n = result["n_trades"]
+    console.print(f"  Trades fechados:  {n}")
+
+    # P2-32: calibração primeiro — é a única coisa que este simulador pode
+    # de fato falsear. market_discount não entra em brier_score/mean_abs_calib_err.
+    console.print()
+    console.print("[bold]── Calibração (o que este simulador mede de verdade) ─[/bold]")
+    brier = result.get("brier_score")
+    mace  = result.get("mean_abs_calib_err")
+    if brier is not None:
+        b_color = "green" if brier < 0.20 else "yellow" if brier < 0.25 else "red"
+        console.print(f"  Brier score:     [{b_color}]{brier:.4f}[/{b_color}]  (0=perfeito, 0.25=chute em 50%)")
+    if mace is not None:
+        m_color = "green" if mace < 0.10 else "yellow" if mace < 0.20 else "red"
+        console.print(f"  Erro calib. médio: [{m_color}]{mace:+.1%}[/{m_color}]  (ponderado por N, por faixa)")
+    if brier is None and mace is None:
+        console.print("  [dim]Sem trades com resolução conhecida.[/dim]")
+
+    cal = result.get("calibration", [])
+    if cal:
+        console.print()
+        cal_tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+        cal_tbl.add_column("Faixa Prob", width=12)
+        cal_tbl.add_column("N",          justify="right", width=6)
+        cal_tbl.add_column("BS_prob",    justify="right", width=9)
+        cal_tbl.add_column("Win Rate",   justify="right", width=10)
+        cal_tbl.add_column("Erro Calib", justify="right", width=11)
+        for row in cal:
+            err = row["calib_err"]
+            err_color = "green" if abs(err) < 0.10 else "yellow" if abs(err) < 0.20 else "red"
+            cal_tbl.add_row(
+                row["prob_bin"],
+                str(row["n"]),
+                f"{row['avg_prob']:.1%}",
+                f"{row['actual_wr']:.1%}",
+                f"[{err_color}]{err:+.1%}[/{err_color}]",
+            )
+        console.print(cal_tbl)
+        console.print(
+            "  [dim]Erro calib. = win_rate_real − BS_prob_prevista. "
+            "Próximo de 0% = modelo bem calibrado.[/dim]"
+        )
+
+    # P&L sintético — depende de market_discount, não é edge medido
+    discount = result.get("market_discount", 0)
+    console.print()
+    console.print(f"[bold yellow]── P&L sintético (desconto assumido = {discount:.0%}) ──[/bold yellow]")
+    console.print(
+        "  [dim italic]market_discount é um parâmetro escolhido, não medido — o P&L abaixo "
+        "é monotônico nele por construção (rode --discount-sweep para ver). "
+        "Não é uma previsão de retorno real.[/dim italic]"
+    )
+
     port = result["final_portfolio"]
     ret  = result["total_return_pct"]
     pnl  = result["total_pnl"]
@@ -813,9 +911,7 @@ def print_sim_summary(result: dict) -> None:
     console.print(f"  P&L realizado:   [{color}]${pnl:+.2f}[/{color}]")
     console.print(f"  Retorno:         [{color}]{ret:+.2f}%[/{color}]")
 
-    n = result["n_trades"]
     wr = result.get("win_rate")
-    console.print(f"  Trades fechados:  {n}")
     if wr is not None:
         wr_color = "green" if wr >= 0.5 else "yellow"
         console.print(f"  Win rate:        [{wr_color}]{wr:.1%}[/{wr_color}]  ({result['n_wins']}/{n})")
@@ -866,40 +962,6 @@ def print_sim_summary(result: dict) -> None:
                 pos.exit_reason or "?",
             )
         console.print(tbl)
-
-    # Calibration table
-    cal = result.get("calibration", [])
-    if cal:
-        console.print()
-        console.print("[bold]── Calibração do Modelo (BS_prob vs. Resultado Real) ─[/bold]")
-        cal_tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
-        cal_tbl.add_column("Faixa Prob", width=12)
-        cal_tbl.add_column("N",          justify="right", width=6)
-        cal_tbl.add_column("BS_prob",    justify="right", width=9)
-        cal_tbl.add_column("Win Rate",   justify="right", width=10)
-        cal_tbl.add_column("Erro Calib", justify="right", width=11)
-        for row in cal:
-            err = row["calib_err"]
-            err_color = "green" if abs(err) < 0.10 else "yellow" if abs(err) < 0.20 else "red"
-            cal_tbl.add_row(
-                row["prob_bin"],
-                str(row["n"]),
-                f"{row['avg_prob']:.1%}",
-                f"{row['actual_wr']:.1%}",
-                f"[{err_color}]{err:+.1%}[/{err_color}]",
-            )
-        console.print(cal_tbl)
-        console.print(
-            "  [dim]Erro calib. = win_rate_real − BS_prob_prevista. "
-            "Próximo de 0% = modelo bem calibrado.[/dim]"
-        )
-
-    discount = result.get("market_discount", 0)
-    console.print()
-    console.print(
-        f"[dim italic]AVISO: Preços sintéticos (desconto={discount:.0%}). "
-        "P&L não reflete o Polymarket real — testa calibração e timing do modelo.[/dim italic]"
-    )
 
 
 # ──────────────────────────────────────────────────────────
@@ -967,10 +1029,31 @@ def generate_html_report(result: dict, output_path: Optional[Path] = None) -> Pa
     else:
         trades_table = "<p><em>Nenhum trade.</em></p>"
 
-    wr   = result.get("win_rate")
-    sh   = result.get("sharpe")
-    ret  = result["total_return_pct"]
-    pnl  = result["total_pnl"]
+    # Calibration table (P2-32) — o que este simulador consegue de fato falsear
+    cal = result.get("calibration", [])
+    if cal:
+        cal_rows = "".join(
+            f"""<tr>
+              <td>{row['prob_bin']}</td><td>{row['n']}</td>
+              <td>{row['avg_prob']:.1%}</td><td>{row['actual_wr']:.1%}</td>
+              <td style="color:{'#00d4aa' if abs(row['calib_err']) < 0.10 else '#ffd93d' if abs(row['calib_err']) < 0.20 else '#ff6b6b'}">{row['calib_err']:+.1%}</td>
+            </tr>"""
+            for row in cal
+        )
+        calibration_table = f"""<table>
+          <thead><tr>
+            <th>Faixa Prob</th><th>N</th><th>BS_prob</th><th>Win Rate</th><th>Erro Calib</th>
+          </tr></thead><tbody>{cal_rows}</tbody></table>"""
+    else:
+        calibration_table = "<p><em>Sem trades com resolução conhecida.</em></p>"
+
+    wr    = result.get("win_rate")
+    sh    = result.get("sharpe")
+    ret   = result["total_return_pct"]
+    pnl   = result["total_pnl"]
+    brier = result.get("brier_score")
+    mace  = result.get("mean_abs_calib_err")
+    discount = result.get("market_discount", 0)
     plotly_cdn = '<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>' if HAS_PLOTLY else ""
 
     html = f"""<!DOCTYPE html>
@@ -987,6 +1070,8 @@ def generate_html_report(result: dict, output_path: Optional[Path] = None) -> Pa
     .subtitle {{ color: #6c757d; font-size: 0.85rem; margin-bottom: 12px; }}
     .warn {{ color: #ffd93d; font-size: 0.8rem; background: #1a1600; border: 1px solid #ffd93d33;
              padding: 8px 14px; border-radius: 6px; margin-bottom: 20px; }}
+    .warn-strong {{ color: #ffd93d; font-size: 0.85rem; background: #1a1600; border: 1px solid #ffd93d55;
+             padding: 10px 16px; border-radius: 6px; margin: 24px 0 14px; font-weight: 600; }}
     .stats-grid {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }}
     .stat-card {{ background: #161b22; border: 1px solid #2d3748; border-radius: 8px; padding: 14px 18px; min-width: 130px; }}
     .stat-value {{ font-size: 1.4rem; font-weight: 700; }}
@@ -1000,15 +1085,30 @@ def generate_html_report(result: dict, output_path: Optional[Path] = None) -> Pa
 <body>
   <h1>Polymarket Quant — Walk-Forward Simulation</h1>
   <p class="subtitle">Gerado em {now_str} &nbsp;|&nbsp; {result['sim_start']} → {result['sim_end']}</p>
-  <p class="warn">⚠ Preços sintéticos: BS_prob usada como proxy para yes_price (dados históricos do Polymarket indisponíveis para mercados resolvidos). P&L testa calibração e timing, não edge real.</p>
+  <p class="warn">⚠ Preços sintéticos: BS_prob usada como proxy para yes_price (dados históricos do Polymarket indisponíveis para mercados resolvidos).</p>
 
-  <h2>Métricas Gerais</h2>
+  <h2>Calibração (o que este simulador mede de verdade)</h2>
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-value">{result['n_trades']}</div><div class="stat-label">Trades Fechados</div></div>
+    <div class="stat-card"><div class="stat-value">{f"{brier:.4f}" if brier is not None else "—"}</div><div class="stat-label">Brier Score (0=perfeito)</div></div>
+    <div class="stat-card"><div class="stat-value">{f"{mace:+.1%}" if mace is not None else "—"}</div><div class="stat-label">Erro Calib. Médio</div></div>
+  </div>
+  {calibration_table}
+
+  <p class="warn-strong">
+    ⚠ P&L sintético — desconto assumido = {discount:.0%}. market_discount é um parâmetro
+    escolhido, não medido: entry_price = BS_prob × (1 − desconto), então edge = desconto × BS_prob,
+    sempre positivo por construção. Os números abaixo são monotônicos nesse parâmetro
+    (rode <code>--discount-sweep</code> pra ver) e não são uma previsão de retorno real —
+    só a calibração acima é.
+  </p>
+
+  <h2>Métricas Gerais (P&L Sintético)</h2>
   <div class="stats-grid">
     <div class="stat-card"><div class="stat-value">${result['initial_capital']:,.0f}</div><div class="stat-label">Capital Inicial</div></div>
     <div class="stat-card"><div class="stat-value">${result['final_portfolio']:,.2f}</div><div class="stat-label">Portfólio Final</div></div>
     <div class="stat-card"><div class="stat-value" style="color:{'#00d4aa' if pnl >= 0 else '#ff6b6b'}">${pnl:+.2f}</div><div class="stat-label">P&L Realizado</div></div>
     <div class="stat-card"><div class="stat-value" style="color:{'#00d4aa' if ret >= 0 else '#ff6b6b'}">{ret:+.2f}%</div><div class="stat-label">Retorno</div></div>
-    <div class="stat-card"><div class="stat-value">{result['n_trades']}</div><div class="stat-label">Trades</div></div>
     <div class="stat-card"><div class="stat-value">{f"{wr:.1%}" if wr is not None else "—"}</div><div class="stat-label">Win Rate</div></div>
     <div class="stat-card"><div class="stat-value">{f"{sh:.2f}" if sh is not None else "—"}</div><div class="stat-label">Sharpe (anual.)</div></div>
     <div class="stat-card"><div class="stat-value" style="color:{'#ff6b6b' if result['max_drawdown_pct'] < 0 else '#e9ecef'}">{result['max_drawdown_pct']:.2f}%</div><div class="stat-label">Max Drawdown</div></div>
@@ -1080,6 +1180,97 @@ def save_results(result: dict) -> Path:
 
 
 # ──────────────────────────────────────────────────────────
+# Sensibilidade ao market_discount (P2-32)
+# ──────────────────────────────────────────────────────────
+
+DEFAULT_SWEEP_DISCOUNTS = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25)
+
+
+def run_discount_sweep(
+    markets: pd.DataFrame,
+    sim_start: datetime,
+    sim_end: datetime,
+    capital: float,
+    min_conviction: float,
+    profit_mult: float,
+    discounts: tuple[float, ...] = DEFAULT_SWEEP_DISCOUNTS,
+    verbose: bool = False,
+) -> list[dict]:
+    """
+    Roda a mesma janela sob vários market_discount pra deixar explícita a
+    circularidade que a auditoria aponta: entry_price = BS_prob × (1 − desconto),
+    logo edge = desconto × BS_prob, sempre positivo por construção. P&L subindo
+    de forma monotônica com o desconto não é um resultado — é a definição da
+    função rodada de novo com outro parâmetro.
+    """
+    # Busca spot/DVOL uma vez só e compartilha entre os discounts — sem isso
+    # seriam N fetches de CoinGecko/Deribit pra dados que não mudam com
+    # market_discount, incluindo o rate-limit/retry de _coingecko_get.
+    spot_cache: dict[str, pd.Series] = {}
+    dvol_cache: dict[str, pd.Series] = {}
+    if not markets.empty:
+        days = max(366, int((sim_end - sim_start).days) + 30)
+        for asset in markets["asset"].unique().tolist():
+            try:
+                spot_cache[asset] = fetch_spot_daily(asset, days=min(days, 365))
+                dvol_cache[asset] = fetch_dvol_daily(asset, days=min(days, 365))
+            except RuntimeError as e:
+                logger.warning(f"Dados {asset} indisponíveis: {e}")
+
+    rows = []
+    for discount in discounts:
+        sim = WalkForwardSimulator(
+            sim_start=sim_start, sim_end=sim_end, initial_capital=capital,
+            min_conviction=min_conviction, profit_mult=profit_mult,
+            market_discount=discount,
+        )
+        sim.spot = dict(spot_cache)
+        sim.dvol = dict(dvol_cache)
+        result = sim.run(markets.copy(), verbose=verbose)
+        rows.append({
+            "market_discount":  discount,
+            "n_trades":         result["n_trades"],
+            "total_pnl":        result["total_pnl"],
+            "total_return_pct": result["total_return_pct"],
+            "sharpe":           result["sharpe"],
+            "brier_score":      result["brier_score"],
+        })
+    return rows
+
+
+def print_discount_sweep(rows: list[dict]) -> None:
+    from rich.console import Console
+    from rich.table import Table
+    from rich import box
+
+    console = Console()
+    console.print()
+    console.print("[bold]── Sensibilidade ao market_discount ──────────────────[/bold]")
+    console.print(
+        "[dim]edge = desconto × BS_prob por construção — o simulador não "
+        "produz P&L negativo pra desconto > 0 com convicção mínima fixa. "
+        "brier_score não muda entre linhas: calibração não depende do desconto.[/dim]"
+    )
+    tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+    tbl.add_column("Desconto",  justify="right", width=9)
+    tbl.add_column("Trades",    justify="right", width=7)
+    tbl.add_column("P&L $",     justify="right", width=10)
+    tbl.add_column("Retorno %", justify="right", width=10)
+    tbl.add_column("Sharpe",    justify="right", width=8)
+    tbl.add_column("Brier",     justify="right", width=8)
+    for row in rows:
+        tbl.add_row(
+            f"{row['market_discount']:.0%}",
+            str(row["n_trades"]),
+            f"${row['total_pnl']:+.2f}",
+            f"{row['total_return_pct']:+.2f}%",
+            f"{row['sharpe']:.2f}" if row["sharpe"] is not None else "—",
+            f"{row['brier_score']:.4f}" if row["brier_score"] is not None else "—",
+        )
+    console.print(tbl)
+
+
+# ──────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────
 
@@ -1104,6 +1295,13 @@ def save_results(result: dict) -> Path:
               help="Salva trades e P&L curve em CSV.")
 @click.option("--quiet",           is_flag=True, default=False,
               help="Suprime logs de abertura de posição.")
+@click.option("--discount-sweep",  is_flag=True, default=False,
+              help=(
+                  "P2-32: em vez de uma simulação, roda a mesma janela sob vários "
+                  "market_discount e imprime a tabela de sensibilidade "
+                  "(--market-discount é ignorado). Torna explícito que P&L é "
+                  "monotônico no parâmetro escolhido, não um resultado medido."
+              ))
 def main(
     days:            Optional[int],
     min_conviction:  float,
@@ -1113,6 +1311,7 @@ def main(
     html:            bool,
     save_csv:        bool,
     quiet:           bool,
+    discount_sweep:  bool,
 ) -> None:
     """
     Simulador walk-forward histórico do modelo Deribit/BS.
@@ -1158,6 +1357,15 @@ def main(
     logger.info(f"Janela: {sim_start.date()} → {sim_end.date()} ({(sim_end-sim_start).days}d)")
     logger.info(f"Mercados disponíveis: {len(markets)} "
                 f"({markets['resolved_yes'].notna().sum()} com resolução conhecida)")
+
+    if discount_sweep:
+        rows = run_discount_sweep(
+            markets=markets, sim_start=sim_start, sim_end=sim_end,
+            capital=capital, min_conviction=min_conviction, profit_mult=profit_mult,
+            verbose=not quiet,
+        )
+        print_discount_sweep(rows)
+        return
 
     logger.info(f"Desconto de mercado: {market_discount:.0%} "
                 f"({'sem edge — 0 trades esperados' if market_discount == 0 else 'simulação com ineficiência sintética'})")
