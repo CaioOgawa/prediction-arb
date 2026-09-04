@@ -950,6 +950,7 @@ def run_paper_trading(
     from risk_manager import (
         resolve_positions, early_exit_positions, check_drawdown_stop,
         portfolio_risk_summary, MAX_OPEN_POSITIONS,
+        reclassify_orphan_arb_legs,
     )
 
     # Defaults vêm do risk_manager — o CLI antigo travava em 10 posições
@@ -981,6 +982,27 @@ def run_paper_trading(
             # Recarrega após resolução
             open_pos  = get_open_positions()
             portfolio = get_or_create_portfolio(initial_capital)
+
+    # ── 1b. Pernas de arb órfãs (P0-5) ──────────────────
+    # Resolução acima pode ter fechado só parte de um basket — a(s) perna(s)
+    # remanescente(s) ficaria(m) nua(s) e sem stop-loss para sempre
+    # (EARLY_EXIT["arb"] é hold-forever por design). Reclassifica para 'value'.
+    orphans = reclassify_orphan_arb_legs(DB_PATH, dry_run=dry_run)
+    if orphans:
+        console.print(f"[bold yellow]Pernas de arb órfãs reclassificadas: {len(orphans)}[/bold yellow]")
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from notify import alert
+            groups = sorted({o["arb_group"] for o in orphans})
+            alert(
+                f"{len(orphans)} perna(s) de arb órfã(s) reclassificada(s) para 'value' "
+                f"(basket parcialmente resolvido): {', '.join(groups)}",
+                cycle="paper_trader",
+            )
+        except Exception:
+            logger.exception("Falha ao notificar reclassificação de pernas órfãs")
+        open_pos  = get_open_positions()
+        portfolio = get_or_create_portfolio(initial_capital)
 
     # ── 2. Saída antecipada ────────────────────────────
     open_pos = get_open_positions()

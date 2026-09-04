@@ -362,6 +362,62 @@ class TestDoubleCredit:
         assert _cash(trading_db) == cash1
 
 
+class TestResolveThresholdNaoEhPreco:
+    """
+    P0-3: preço de mercado != resolução. RESOLVE_THRESHOLD=0.95 fechava posições
+    vivas a -100% (posição ETH-$10k, vencimento dezembro, "resolvida NO" 31min
+    após abertura porque YES caiu abaixo de 0.05). Preço extremo só pode contar
+    como resolução quando o mercado TAMBÉM já venceu (endDate no passado).
+    """
+
+    def test_preco_extremo_sem_closed_e_sem_vencimento_nao_resolve(self, trading_db):
+        # YES a 0.03 (p_no=0.97) teria disparado o RESOLVE_THRESHOLD antigo de 0.95.
+        # Mercado não fechou e vence só em 2027 → precisa continuar aberto.
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "closed": False,
+            "outcomePrices": '["0.03", "0.97"]',
+            "endDate": "2027-01-01T00:00:00Z",
+        }])
+        resolved = risk_manager.resolve_positions(open_pos, mkt, trading_db)
+        assert resolved == []
+        assert not _open_positions_df(trading_db).empty
+
+    def test_preco_extremo_com_vencimento_passado_resolve(self, trading_db):
+        # Mesmo preço extremo, mas endDate já passou → convergência é confiável.
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "closed": False,
+            "outcomePrices": '["0.001", "0.999"]',
+            "endDate": "2020-01-01T00:00:00Z",
+        }])
+        resolved = risk_manager.resolve_positions(open_pos, mkt, trading_db)
+        assert len(resolved) == 1
+        assert resolved[0]["status"] == "closed"
+
+    def test_closed_flag_ainda_resolve_sem_endDate(self, trading_db):
+        # closed=True da API é sinal de resolução válido por si só, com ou sem endDate.
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "closed": True,
+            "outcomePrices": '["1.0", "0.0"]',
+        }])
+        resolved = risk_manager.resolve_positions(open_pos, mkt, trading_db)
+        assert len(resolved) == 1
+        assert resolved[0]["exit_price"] == 1.0
+
+    def test_preco_0_95_nao_basta_mais(self, trading_db):
+        # O threshold antigo (0.95) não deve mais disparar resolução sozinho.
+        open_pos = _open_positions_df(trading_db)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xaaa", "closed": False,
+            "outcomePrices": '["0.04", "0.96"]',
+            "endDate": "2027-01-01T00:00:00Z",
+        }])
+        resolved = risk_manager.resolve_positions(open_pos, mkt, trading_db)
+        assert resolved == []
+
+
 class TestKelly:
     def test_edge_abaixo_do_minimo_da_zero(self):
         assert risk_manager.kelly_size(
@@ -678,6 +734,84 @@ class TestArbHoldUntilResolution:
         # Lucro de 1.9× e prejuízo de 90% — nada dispara para arb
         assert ws_feed.evaluate_exit(info, 0.95, 0.96) is None
         assert ws_feed.evaluate_exit(info, 0.05, 0.06) is None
+
+
+class TestOrphanArbLegs:
+    """
+    P0-5: abertura de basket é atômica (open_basket), resolução não era —
+    quando uma perna resolve e a outra fica aberta, a perna remanescente virava
+    posição direcional NUA (EARLY_EXIT["arb"] é hold-forever por design).
+    Caso real em produção: basket mono:0x201f51d2>0x3c16fd3f, perna de $2.33
+    fechada pelo bug do RESOLVE_THRESHOLD (P0-3), perna de $47.67 (22% do
+    livro) ficou aberta e sem stop-loss.
+    """
+
+    def _insert_leg(self, db, condition_id, arb_group, status):
+        conn = sqlite3.connect(db)
+        conn.execute("""
+            INSERT INTO positions
+              (condition_id, question, direction, entry_price, shares, cost_usdc,
+               status, trade_type, arb_group, opened_at)
+            VALUES (?, 'Perna arb?', 'BUY_YES', 0.5, 10, 5, ?, 'arb', ?, '2026-01-01 00:00:00')
+        """, (condition_id, status, arb_group))
+        conn.commit()
+        conn.close()
+
+    def test_perna_com_irma_resolvida_e_orfa(self, basket_db):
+        self._insert_leg(basket_db, "0xa", "mono:0xa>0xb", "closed")
+        self._insert_leg(basket_db, "0xb", "mono:0xa>0xb", "open")
+
+        orphans = risk_manager.find_orphan_arb_legs(basket_db)
+        assert list(orphans["condition_id"]) == ["0xb"]
+
+    def test_basket_intacto_nao_gera_orfa(self, basket_db):
+        self._insert_leg(basket_db, "0xa", "mono:0xa>0xb", "open")
+        self._insert_leg(basket_db, "0xb", "mono:0xa>0xb", "open")
+
+        assert risk_manager.find_orphan_arb_legs(basket_db).empty
+
+    def test_basket_totalmente_resolvido_nao_gera_orfa(self, basket_db):
+        self._insert_leg(basket_db, "0xa", "mono:0xa>0xb", "closed")
+        self._insert_leg(basket_db, "0xb", "mono:0xa>0xb", "closed")
+
+        assert risk_manager.find_orphan_arb_legs(basket_db).empty
+
+    def test_reclassifica_perna_orfa_para_value(self, basket_db):
+        self._insert_leg(basket_db, "0xa", "mono:0xa>0xb", "closed")
+        self._insert_leg(basket_db, "0xb", "mono:0xa>0xb", "open")
+
+        result = risk_manager.reclassify_orphan_arb_legs(basket_db)
+        assert len(result) == 1
+        assert result[0]["condition_id"] == "0xb"
+
+        pos = _open_positions_df(basket_db)
+        row = pos[pos["condition_id"] == "0xb"].iloc[0]
+        assert row["trade_type"] == "value"
+
+        # Idempotente: a perna já não é mais 'arb', some da próxima varredura
+        assert risk_manager.reclassify_orphan_arb_legs(basket_db) == []
+
+    def test_reclassificacao_reativa_stop_loss(self, basket_db):
+        """Depois de reclassificada, a perna passa a poder sair por stop_loss —
+        exatamente o que EARLY_EXIT['arb'] proibia (hold-forever)."""
+        self._insert_leg(basket_db, "0xa", "mono:0xa>0xb", "closed")
+        self._insert_leg(basket_db, "0xb", "mono:0xa>0xb", "open")
+        risk_manager.reclassify_orphan_arb_legs(basket_db)
+
+        open_pos = _open_positions_df(basket_db)
+        mkt = pd.DataFrame([{"conditionId": "0xb", "yes_price": 0.05, "spread": 0.01}])
+        exits = risk_manager.early_exit_positions(open_pos, mkt, basket_db)
+        assert len(exits) == 1
+        assert exits[0]["trigger"].startswith("stop_loss")
+
+    def test_dry_run_nao_persiste(self, basket_db):
+        self._insert_leg(basket_db, "0xa", "mono:0xa>0xb", "closed")
+        self._insert_leg(basket_db, "0xb", "mono:0xa>0xb", "open")
+
+        result = risk_manager.reclassify_orphan_arb_legs(basket_db, dry_run=True)
+        assert len(result) == 1
+        pos = _open_positions_df(basket_db)
+        assert pos[pos["condition_id"] == "0xb"].iloc[0]["trade_type"] == "arb"
 
 
 class TestStructuralExposure:

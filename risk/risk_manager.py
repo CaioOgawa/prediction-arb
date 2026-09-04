@@ -382,11 +382,17 @@ def resolve_positions(
     if open_positions.empty or current_markets.empty:
         return []
 
-    RESOLVE_THRESHOLD = 0.95
+    # P0-3: preço de mercado NÃO é resolução. Um YES a 0.03 é só "quase todo mundo
+    # acha que não" — não significa que o evento já aconteceu. Tratar isso como
+    # resolução fechava posições vivas a -100% meses antes do vencimento (posição
+    # ETH-$10k resolvida "NO" 31min após abertura, vencimento em dezembro).
+    # Preço extremo só conta como resolução quando o mercado TAMBÉM já venceu.
+    RESOLVE_PRICE_THRESHOLD = 0.999
 
     # Indexa mercados pelo conditionId
     mkt_index = current_markets.drop_duplicates("conditionId").set_index("conditionId")
 
+    now_utc = datetime.now(timezone.utc)
     resolved = []
     conn = sqlite3.connect(db_path) if not dry_run else None
 
@@ -400,19 +406,24 @@ def resolve_positions(
 
             # Verifica se fechou
             is_closed = bool(mkt.get("closed", False))
+
+            end_date_raw = mkt.get("endDate") or mkt.get("end_date")
+            end_date = pd.to_datetime(end_date_raw, utc=True, errors="coerce")
+            past_end_date = bool(pd.notna(end_date) and end_date < now_utc)
+
             outcome_raw = mkt.get("outcomePrices")
             prices = _parse_outcome_prices(outcome_raw)
 
             outcome = None  # 1 = YES ganhou, 0 = NO ganhou
-            if prices is not None:
+            if prices is not None and (is_closed or past_end_date):
                 p_yes, p_no = prices
-                if p_yes >= RESOLVE_THRESHOLD:
+                if p_yes >= RESOLVE_PRICE_THRESHOLD:
                     outcome = 1
-                elif p_no >= RESOLVE_THRESHOLD:
+                elif p_no >= RESOLVE_PRICE_THRESHOLD:
                     outcome = 0
 
             if not is_closed and outcome is None:
-                continue  # mercado ainda aberto
+                continue  # mercado ainda aberto (ou vencido sem convergência clara)
 
             # Calcula P&L
             direction   = pos["direction"]
@@ -486,6 +497,84 @@ def resolve_positions(
             conn.close()
 
     return resolved
+
+
+def find_orphan_arb_legs(db_path: Path) -> pd.DataFrame:
+    """
+    P0-5: `open_basket` abre todas as pernas numa única transação, mas a
+    resolução é por posição — se uma perna do arb_group resolve e outra não,
+    a perna remanescente vira posição direcional NUA. `EARLY_EXIT["arb"]` é
+    hold-forever por design (correto enquanto o basket está intacto: fechar
+    uma perna isolada destruiria a garantia), então uma perna órfã nunca teria
+    stop-loss se ninguém a tirasse do grupo "arb".
+
+    Retorna as pernas 'arb'/'open' cujo arb_group já tem alguma perna
+    'closed'/'expired' — i.e., a garantia do basket já foi rompida.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query("""
+            SELECT id, arb_group, condition_id, status
+            FROM positions
+            WHERE trade_type = 'arb' AND arb_group IS NOT NULL AND arb_group != ''
+        """, conn)
+    finally:
+        conn.close()
+
+    if df.empty:
+        return df
+
+    counts = df.groupby("arb_group")["status"].agg(
+        n_total="count",
+        n_open=lambda s: (s == "open").sum(),
+    )
+    orphan_groups = counts[(counts["n_open"] > 0) & (counts["n_open"] < counts["n_total"])].index
+    return df[df["arb_group"].isin(orphan_groups) & (df["status"] == "open")].copy()
+
+
+def reclassify_orphan_arb_legs(db_path: Path, dry_run: bool = False) -> list[dict]:
+    """
+    Reclassifica pernas órfãs (ver find_orphan_arb_legs) de trade_type='arb'
+    para 'value' — reativa profit_target/stop_loss/edge_flip do EARLY_EXIT,
+    que a perna nua nunca teria enquanto marcada como 'arb'.
+
+    Idempotente: uma vez reclassificada, a perna some do próximo
+    find_orphan_arb_legs (deixa de ter trade_type='arb').
+    """
+    orphans = find_orphan_arb_legs(db_path)
+    if orphans.empty:
+        return []
+
+    reclassified = []
+    conn = None if dry_run else sqlite3.connect(db_path)
+    try:
+        for _, leg in orphans.iterrows():
+            leg_id = int(leg["id"])
+            if conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute("""
+                    UPDATE positions SET trade_type = 'value'
+                    WHERE id = ? AND status = 'open' AND trade_type = 'arb'
+                """, (leg_id,))
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    continue
+                conn.commit()
+            reclassified.append({
+                "id":           leg_id,
+                "arb_group":    leg["arb_group"],
+                "condition_id": leg["condition_id"],
+            })
+            logger.warning(
+                f"P0-5: perna órfã reclassificada arb→value | posição {leg_id} "
+                f"arb_group={leg['arb_group']} — basket parcialmente resolvido, "
+                f"perna remanescente ganha stop-loss"
+            )
+    finally:
+        if conn:
+            conn.close()
+
+    return reclassified
 
 
 # ──────────────────────────────────────────────────────────

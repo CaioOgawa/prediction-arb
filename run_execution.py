@@ -72,7 +72,7 @@ def main(dry_run: bool, mode: str) -> None:
         rebalance_positions,
         print_portfolio,
     )
-    from risk_manager import resolve_positions, early_exit_positions
+    from risk_manager import resolve_positions, early_exit_positions, reclassify_orphan_arb_legs
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     logger.info(f"=== Execution daemon iniciado: {now} ===")
@@ -99,6 +99,26 @@ def main(dry_run: bool, mode: str) -> None:
                     f"→ {sign}${r['pnl_usdc']:.2f}"
                 )
         # Recarrega após resolução
+        open_pos  = get_open_positions()
+        portfolio = get_or_create_portfolio()
+
+    # ── 1b. Pernas de arb órfãs (P0-5) ───────────────────────
+    orphans = reclassify_orphan_arb_legs(DB_PATH, dry_run=dry_run)
+    if orphans:
+        groups = sorted({o["arb_group"] for o in orphans})
+        logger.warning(
+            f"Pernas de arb órfãs reclassificadas para 'value': {len(orphans)} "
+            f"({', '.join(groups)})"
+        )
+        try:
+            from notify import alert
+            alert(
+                f"{len(orphans)} perna(s) de arb órfã(s) reclassificada(s) para 'value' "
+                f"(basket parcialmente resolvido): {', '.join(groups)}",
+                cycle="run_execution",
+            )
+        except Exception:
+            logger.exception("Falha ao notificar reclassificação de pernas órfãs")
         open_pos  = get_open_positions()
         portfolio = get_or_create_portfolio()
 
