@@ -396,6 +396,9 @@ def opportunities_to_frame(opps: list[dict]) -> pd.DataFrame:
                 "guaranteed":   bool(opp.get("guaranteed", False)),
                 "liquidity":    leg.get("liquidity", 0.0),
                 "event_slug":   opp.get("event_slug", ""),
+                # P1-11: monotonicidade tem "asset" (BTC/ETH) por perna —
+                # negrisk não tem (evento multi-outcome não-crypto), fica "".
+                "underlying":   leg.get("asset", ""),
                 "signal_source": "structural",
                 "trade_type":    "arb",
                 "confidence":    0.9,  # execução/resolução, não incerteza de modelo

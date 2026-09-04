@@ -705,6 +705,7 @@ def run(
             "condition_id":   market_row.get("conditionId"),
             "question":       str(market_row.get("question", ""))[:80],
             "category":       str(market_row.get("category", "")),
+            "underlying":     asset,   # P1-11: ativo real p/ cap de exposição por underlying
             "asset":          asset,
             "strike":         strike,
             "direction":      direction,

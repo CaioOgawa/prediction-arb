@@ -96,16 +96,20 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         # Migrations: adiciona colunas ausentes sem recriar a tabela
         existing = {r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()}
-        for col, typedef in [
+        for col_name, typedef in [
             ("signal_source", "TEXT"),
             ("confidence", "REAL"),
             ("trade_type", "TEXT DEFAULT 'value'"),
             ("event_slug", "TEXT DEFAULT ''"),
             ("arb_group", "TEXT DEFAULT ''"),
+            ("underlying", "TEXT DEFAULT ''"),  # P1-11: ativo real (BTC/ETH, sport_key:matchup)
         ]:
-            col_name = col.split()[0]
             if col_name not in existing:
-                conn.execute(f"ALTER TABLE positions ADD COLUMN {col}")
+                # Bug pré-existente: o ALTER TABLE só usava {col}, descartando
+                # {typedef} — colunas migradas ficavam sem tipo/default (NULL
+                # em vez de '' ou 'value'), provavelmente a origem real do
+                # P1-17 (trade_type NULL/NaN em posições antigas).
+                conn.execute(f"ALTER TABLE positions ADD COLUMN {col_name} {typedef}")
                 logger.info(f"Migração: coluna '{col_name}' adicionada à tabela positions")
         conn.commit()
 
@@ -324,6 +328,16 @@ def open_position(
         open_value = 0.0
     effective_capital = cash + open_value * 0.5
 
+    # P1-11d: quantas posições já abertas compartilham o mesmo underlying
+    # (BTC, ETH, sport_key:matchup) — Kelly independente sobre apostas
+    # correlacionadas superaposta risco por ~√n.
+    underlying = str(signal.get("underlying", "")).lower()
+    n_correlated = 1
+    if underlying and not open_pos_for_capital.empty and "underlying" in open_pos_for_capital.columns:
+        n_correlated = 1 + int(
+            (open_pos_for_capital["underlying"].fillna("").str.lower() == underlying).sum()
+        )
+
     # Kelly com confidence modulation — sizing varia por trade_type
     size_usdc = kelly_size(
         edge=edge,
@@ -332,6 +346,7 @@ def open_position(
         confidence=confidence,
         signal_source=signal_source,
         trade_type=trade_type,
+        n_correlated=n_correlated,
     )
 
     # Recalcula entry_price com market impact agora que size_usdc é conhecido
@@ -349,7 +364,8 @@ def open_position(
     _q = str(signal.get("question", ""))[:40]
 
     if size_usdc < 2.0:
-        logger.info(f"REJEITADO [kelly_pequeno ${size_usdc:.2f}] {_q}")
+        motivo = f"correlacao n={n_correlated}" if n_correlated > 1 else "kelly_pequeno"
+        logger.info(f"REJEITADO [{motivo} ${size_usdc:.2f}] {_q}")
         return None
 
     # Não reabrir mercados já operados neste portfólio (evita loop em mercados resolvidos)
@@ -357,9 +373,12 @@ def open_position(
         logger.debug(f"REJEITADO [já_operado] {cid[:16]}")
         return None
 
-    # Verificações de diversificação
+    # Verificações de diversificação — P1-11b: denominador é cash + MTM
+    # (total_value), não initial_capital, senão os caps folgam depois de um
+    # drawdown em vez de apertar.
     open_pos = get_open_positions()
-    can_trade, reason = check_exposure(signal, open_pos, portfolio, size_usdc)
+    total_value = cash + open_value
+    can_trade, reason = check_exposure(signal, open_pos, portfolio, size_usdc, total_value=total_value)
     if not can_trade:
         logger.info(f"REJEITADO [risco: {reason}] {_q}")
         return None
@@ -370,6 +389,7 @@ def open_position(
         "condition_id":   signal.get("condition_id", ""),
         "question":       str(signal.get("question", ""))[:100],
         "category":       str(signal.get("category", "")),
+        "underlying":     str(signal.get("underlying", "")),
         "signal_source":  signal_source,
         "trade_type":     trade_type,
         "direction":      direction,
@@ -393,18 +413,20 @@ def open_position(
             conn.execute("ALTER TABLE positions ADD COLUMN trade_type TEXT DEFAULT 'value'")
         if "event_slug" not in cols:
             conn.execute("ALTER TABLE positions ADD COLUMN event_slug TEXT DEFAULT ''")
+        if "underlying" not in cols:
+            conn.execute("ALTER TABLE positions ADD COLUMN underlying TEXT DEFAULT ''")
 
         conn.execute("""
             INSERT INTO positions
-              (condition_id, question, category, signal_source, trade_type, direction,
+              (condition_id, question, category, underlying, signal_source, trade_type, direction,
                entry_price, shares, cost_usdc, edge_at_entry, prob_at_entry,
                confidence, end_date, event_slug)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             position["condition_id"], position["question"], position["category"],
-            position["signal_source"], position["trade_type"], position["direction"],
-            position["entry_price"], position["shares"], position["cost_usdc"],
-            position["edge_at_entry"], position["prob_at_entry"],
+            position["underlying"], position["signal_source"], position["trade_type"],
+            position["direction"], position["entry_price"], position["shares"],
+            position["cost_usdc"], position["edge_at_entry"], position["prob_at_entry"],
             position["confidence"], position["end_date"], position["event_slug"],
         ))
         cur = conn.execute(
@@ -520,6 +542,7 @@ def open_basket(
             "exec_price":   price,
             "liquidity":    float(r.get("liquidity") or 0),
             "event_slug":   str(r.get("event_slug") or ""),
+            "underlying":   str(r.get("underlying") or ""),
         })
 
     # Dedupe: qualquer perna já operada neste portfólio cancela o basket inteiro
@@ -618,14 +641,20 @@ def open_basket(
                 logger.warning(f"BASKET cancelado [caixa insuficiente p/ ${total_cost:.2f}] {arb_group}")
                 return None
             for leg, leg_cost in zip(legs, leg_costs):
+                # P1-11a: category NÃO recebe arb_kind mais — eram dois
+                # conceitos sobrepostos na mesma coluna (categoria de mercado
+                # da Gamma API vs. tipo de arb). arb_kind já vive em
+                # arb_group (prefixo "mono:"/"neg:"); underlying carrega o
+                # ativo real (BTC/ETH) para o cap de underlying pegar
+                # posições correlacionadas mesmo vindas de baskets.
                 conn.execute("""
                     INSERT INTO positions
-                      (condition_id, question, category, signal_source, trade_type,
+                      (condition_id, question, category, underlying, signal_source, trade_type,
                        direction, entry_price, shares, cost_usdc, edge_at_entry,
                        prob_at_entry, confidence, end_date, event_slug, arb_group)
-                    VALUES (?, ?, ?, 'structural', 'arb', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, '', ?, 'structural', 'arb', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    leg["condition_id"], leg["question"], arb_kind,
+                    leg["condition_id"], leg["question"], leg["underlying"],
                     leg["direction"], round(leg["exec_price"], 4), shares, leg_cost,
                     summary["edge"], round(leg["exec_price"], 4),
                     float(first.get("confidence", 0.9)), "", leg["event_slug"], arb_group,

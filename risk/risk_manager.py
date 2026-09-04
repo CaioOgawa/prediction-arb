@@ -61,6 +61,26 @@ MAX_OPEN_POSITIONS = 20     # Mais posições simultâneas para diversificar
 MAX_MOMENTUM_POS   = 12     # Máx de posições momentum abertas (rotação rápida)
 MAX_VALUE_POS      = 10     # Máx de posições value abertas (hold longo)
 
+# P1-11: `category` é o texto de categoria da Gamma API — taxonomia não
+# controlada ("what" é artefato de parsing) e sobreposta pelo `arb_kind` que
+# `open_basket` escrevia na mesma coluna. Não captura a correlação real: BTC
+# acima de $62k/$64k/$74k/$78k e "reach $70k/$75k/$100k/$110k" são 9 apostas
+# na MESMA variável (spot do BTC) espalhadas em 3 "categorias" — cada uma
+# abaixo do cap de categoria, nenhuma pega a concentração real (69% do livro
+# em cripto). `underlying` é preenchido pelos geradores de sinal com o ativo
+# real (BTC/ETH, ou `sport_key:matchup` em odds) — MAX_UNDERLYING_PCT é o
+# check que teria pego esse livro.
+MAX_UNDERLYING_PCT = 0.15   # 15% do capital por underlying (mais apertado que categoria)
+
+# P1-11e: 20 das 21 posições abertas do livro real eram BUY_YES — isso não é
+# diversificação, é aposta alavancada num viés sistemático do gerador de
+# sinal (ou do fato de que perguntas Polymarket tendem a enquadrar o "sim"
+# como o lado caro). Cap na fração do book DIRECIONAL (exclui arb) que pode
+# estar do mesmo lado. Só entra em vigor com massa crítica de posições —
+# a primeira posição do livro sempre teria skew 100%.
+MAX_DIRECTIONAL_SKEW_PCT      = 0.75
+MIN_POSITIONS_FOR_SKEW_CHECK  = 5
+
 # Drawdown
 WEEKLY_STOP_PCT   = 0.10   # Halt de novas posições se perder 10% em 7 dias
 DAILY_STOP_PCT    = 0.05   # Halt diário se perder 5% no dia
@@ -145,6 +165,7 @@ def kelly_size(
     confidence: float = 1.0,
     signal_source: str = "odds",
     trade_type: str = "value",
+    n_correlated: int = 1,
 ) -> float:
     """
     Calcula o tamanho da posição em USDC via Kelly fracionado.
@@ -170,12 +191,19 @@ def kelly_size(
       - Multiplica pelo confidence score (0–1) da fonte de sinal
       - Aplica hard cap de MAX_POSITION_PCT do capital
 
+    P1-11d: Kelly independente sobre apostas correlacionadas superaposta por
+    ~√n. n_correlated (nº de posições já abertas no mesmo underlying — BTC,
+    ETH, mlb:<game_id>) escala o Kelly por 1/n_correlated: a 2ª posição em
+    BTC arrisca metade, a 3ª um terço, e assim por diante. O caller (quem
+    tem acesso ao book aberto) calcula n_correlated e passa aqui.
+
     Args:
         edge:          fair_prob - market_price, esperança de lucro por unidade de prob.
         entry_price:   preço pago pelo token (já com spread/slippage)
         capital:       caixa disponível em USDC
         confidence:    score de confiança do sinal (0–1), calculado em signal_generator
         signal_source: 'odds' | 'deribit' | 'ml'
+        n_correlated:  nº de posições já abertas no mesmo underlying (>=1)
 
     Returns:
         Tamanho da posição em USDC (0 se não deve operar).
@@ -213,6 +241,12 @@ def kelly_size(
 
     # Aplica frações conservadoras
     kelly_used = kelly_full * KELLY_MAX_FRAC * confidence
+
+    # P1-11d: escala por 1/n_correlated — Kelly independente sobre apostas
+    # correlacionadas (mesmo underlying) superaposta por ~√n.
+    if n_correlated > 1:
+        kelly_used /= n_correlated
+
     kelly_used = float(np.clip(kelly_used, 0.0, pos_pct))
 
     size     = capital * kelly_used
@@ -239,14 +273,25 @@ def check_exposure(
     open_positions: pd.DataFrame,
     portfolio: dict,
     size_usdc: float,
+    total_value: float | None = None,
 ) -> tuple[bool, str]:
     """
     Verifica se abrir esta posição viola os limites de diversificação.
+
+    Args:
+        total_value: cash + MTM das posições abertas — denominador dos caps
+            de exposição (categoria/fonte/underlying). P1-11b: usar
+            initial_capital como denominador deixava os caps folgarem
+            exatamente quando deveriam apertar — depois de um drawdown para
+            $500, "30% por categoria" ainda autorizava $300 = 60% da
+            carteira real. Sem valor passado (compat com chamadas antigas /
+            testes), cai para initial_capital.
 
     Returns:
         (pode_operar, motivo_se_nao)
     """
     initial_capital = float(portfolio.get("initial_capital", 1000))
+    denom = float(total_value) if total_value is not None and total_value > 0 else initial_capital
 
     if open_positions.empty:
         return True, ""
@@ -280,8 +325,21 @@ def check_exposure(
         cat_cost = open_positions[
             open_positions["category"].str.lower() == category
         ]["cost_usdc"].sum()
-        if (cat_cost + size_usdc) / initial_capital > MAX_CATEGORY_PCT:
+        if (cat_cost + size_usdc) / denom > MAX_CATEGORY_PCT:
             return False, f"limite de categoria '{category}' ({MAX_CATEGORY_PCT:.0%}) atingido"
+
+    # 4b. Limite por underlying (P1-11a/c) — BTC acima de $62k/$64k/$74k/$78k
+    # e "reach $70k/$75k/$100k/$110k" são 9 apostas na MESMA variável (spot do
+    # BTC) espalhadas por categorias diferentes; o cap de categoria nunca as
+    # via juntas. underlying é o ativo real (BTC/ETH) ou sport_key:matchup —
+    # preenchido pelos geradores de sinal, não a categoria solta da Gamma API.
+    underlying = str(signal.get("underlying", "")).lower()
+    if underlying and "underlying" in open_positions.columns:
+        under_cost = open_positions[
+            open_positions["underlying"].fillna("").str.lower() == underlying
+        ]["cost_usdc"].sum()
+        if (under_cost + size_usdc) / denom > MAX_UNDERLYING_PCT:
+            return False, f"limite de underlying '{underlying}' ({MAX_UNDERLYING_PCT:.0%}) atingido"
 
     # 5. Limite por fonte de sinal
     source = str(signal.get("signal_source", "")).lower()
@@ -289,7 +347,7 @@ def check_exposure(
         src_cost = open_positions[
             open_positions["signal_source"].str.lower() == source
         ]["cost_usdc"].sum()
-        if (src_cost + size_usdc) / initial_capital > MAX_SOURCE_PCT:
+        if (src_cost + size_usdc) / denom > MAX_SOURCE_PCT:
             return False, f"limite de fonte '{source}' ({MAX_SOURCE_PCT:.0%}) atingido"
 
     # 6. Correlação: mesmo evento (event_slug) já tem posição aberta
@@ -308,6 +366,27 @@ def check_exposure(
                 f"evento '{event_slug[:40]}' já tem posição aberta "
                 f"({', '.join(existing_dirs)}) — correlação bloqueada"
             )
+
+    # 7. Skew direcional (P1-11e): 20 das 21 posições do livro real eram
+    # BUY_YES — não é diversificação, é uma aposta alavancada no viés do
+    # gerador de sinal. Só entra em vigor com massa crítica de posições
+    # direcionais (arb fica de fora — hedge estrutural, não é aposta de
+    # direção) para não bloquear as primeiras posições do livro.
+    direction = str(signal.get("direction", "")).upper()
+    if direction in ("BUY_YES", "BUY_NO") and trade_type != "arb" \
+            and {"trade_type", "direction"} <= set(open_positions.columns):
+        directional = open_positions[open_positions["trade_type"].fillna("value") != "arb"]
+        if len(directional) >= MIN_POSITIONS_FOR_SKEW_CHECK:
+            total_directional_cost = float(directional["cost_usdc"].sum()) + size_usdc
+            same_dir_cost = float(
+                directional[directional["direction"] == direction]["cost_usdc"].sum()
+            ) + size_usdc
+            if total_directional_cost > 0 and \
+                    same_dir_cost / total_directional_cost > MAX_DIRECTIONAL_SKEW_PCT:
+                return False, (
+                    f"skew direcional: {direction} passaria de "
+                    f"{MAX_DIRECTIONAL_SKEW_PCT:.0%} do book direcional"
+                )
 
     return True, ""
 

@@ -650,6 +650,22 @@ def _team_variants(team_raw: str, sport_key: str = "") -> set[str]:
     return variants
 
 
+def _underlying_key(sport_key: str, team_a: str, team_b: str = "") -> str:
+    """
+    P1-11: chave de correlação para o cap de exposição por underlying —
+    identifica o jogo/participante real, não a categoria solta da Gamma API.
+    Usa nomes canônicos (via _normalize_team) para que apelidos diferentes do
+    mesmo time (ex: "Lakers" vs "LA Lakers") caiam na mesma chave. Ordem dos
+    times não importa: "A vs B" e "B vs A" são o mesmo jogo.
+    """
+    a = _normalize_team(team_a, sport_key)
+    if not team_b:
+        return f"{sport_key}:{a}"
+    b = _normalize_team(team_b, sport_key)
+    lo, hi = sorted([a, b])
+    return f"{sport_key}:{lo}v{hi}"
+
+
 def _token_similarity(a: str, b: str) -> float:
     """Similaridade por sobreposição de tokens (case-insensitive)."""
     tokens_a = set(a.lower().split())
@@ -829,10 +845,12 @@ def match_markets_to_odds(
             )
             continue
 
+        sport_key_val = best_match.get("sport_key", "")
         rows.append({
             "condition_id":     mkt.get("conditionId"),
             "question":         question,
             "category":         mkt.get("category", ""),
+            "underlying":       _underlying_key(sport_key_val, home_team, away_team),
             "yes_price":        round(yes_price, 4),
             "fair_prob_yes":    round(fair_yes, 4),
             "fair_prob_no":     round(fair_no, 4),
@@ -1046,6 +1064,7 @@ def match_outright_markets(
             "condition_id":  mkt.get("conditionId"),
             "question":      question,
             "category":      mkt.get("category", ""),
+            "underlying":    _underlying_key(best_ep["sport_key"], subject),
             "yes_price":     round(yes_price, 4),
             "fair_prob_yes": round(best_prob, 4),
             "fair_prob_no":  round(1.0 - best_prob, 4),

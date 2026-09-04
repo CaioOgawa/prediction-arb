@@ -270,6 +270,23 @@ class TestAliases:
         )
         assert s == 0.0
 
+    def test_underlying_key_independe_da_ordem_dos_times(self):
+        # P1-11: "A vs B" e "B vs A" são o mesmo jogo — mesma chave de correlação.
+        k1 = odds_collector._underlying_key("basketball_nba", "Lakers", "Celtics")
+        k2 = odds_collector._underlying_key("basketball_nba", "Celtics", "Lakers")
+        assert k1 == k2
+
+    def test_underlying_key_usa_nome_canonico(self):
+        # "Spurs" ambíguo — o esporte já resolve para o time canônico certo,
+        # então dois apelidos do mesmo time caem na mesma chave.
+        k1 = odds_collector._underlying_key("basketball_nba", "Spurs", "Lakers")
+        k2 = odds_collector._underlying_key("basketball_nba", "San Antonio Spurs", "Lakers")
+        assert k1 == k2 == "basketball_nba:los angeles lakersvsan antonio spurs"
+
+    def test_underlying_key_outright_sem_oponente(self):
+        k = odds_collector._underlying_key("basketball_nba", "Lakers")
+        assert k == "basketball_nba:los angeles lakers"
+
 
 # ──────────────────────────────────────────────────────────
 # deribit_collector — direção de touch options
@@ -929,6 +946,7 @@ def _basket_group(arb_group="mono:0xa>0xb", legs=None) -> pd.DataFrame:
             "abs_edge": abs(1.0 - sum(l["leg_price"] for l in legs)),
             "guaranteed": True, "liquidity": 10_000.0, "event_slug": "ev-x",
             "signal_source": "structural", "trade_type": "arb", "confidence": 0.9,
+            "underlying": leg.get("underlying", ""),
         })
     return pd.DataFrame(rows)
 
@@ -947,10 +965,26 @@ class TestOpenBasket:
         assert set(pos["trade_type"]) == {"arb"}
         assert set(pos["signal_source"]) == {"structural"}
         assert set(pos["arb_group"]) == {"mono:0xa>0xb"}
+        # P1-11a: category não recebe mais arb_kind ("monotonicity") — os
+        # dois eram conceitos sobrepostos na mesma coluna.
+        assert set(pos["category"]) == {""}
         # Mesmo nº de shares nas duas pernas (a matemática do arb exige)
         assert pos["shares"].nunique() == 1
         # Débito único = soma dos custos das pernas
         assert abs((1000 - _cash(basket_db)) - result["total_cost"]) < 0.02
+
+    def test_underlying_da_perna_e_persistido(self, basket_db):
+        # P1-11: monotonicidade tem asset real (BTC/ETH) por perna — precisa
+        # sobreviver até a tabela positions para o cap de underlying funcionar.
+        legs = [
+            {"condition_id": "0xa", "direction": "BUY_YES", "leg_price": 0.50, "underlying": "BTC"},
+            {"condition_id": "0xb", "direction": "BUY_NO",  "leg_price": 0.38, "underlying": "BTC"},
+        ]
+        portfolio = paper_trader.get_or_create_portfolio(1000)
+        result = paper_trader.open_basket(portfolio, _basket_group(legs=legs), self.EMPTY_MKTS)
+        assert result is not None
+        pos = _open_positions_df(basket_db)
+        assert set(pos["underlying"]) == {"BTC"}
 
     def test_caixa_insuficiente_nao_abre_nenhuma_perna(self, basket_db):
         """Atomicidade: guard de cash falhou → rollback, zero posições órfãs."""
@@ -1170,6 +1204,193 @@ class TestStructuralExposure:
             self._open_arb_legs(), {"initial_capital": 1000}, 5.0,
         )
         assert ok, reason
+
+
+class TestUnderlyingExposure:
+    """
+    P1-11: `category` não captura correlação real. Livro real da auditoria:
+    BTC acima de $62k/$64k/$74k/$78k + "reach $70k/$75k/$100k/$110k" — 9
+    posições na MESMA variável (spot do BTC) espalhadas por categorias
+    diferentes, cada uma abaixo do cap de 30%. underlying agrupa pelo ativo
+    real; MAX_UNDERLYING_PCT (15%) é o check que pegaria isso.
+    """
+
+    def _btc_positions(self, n, cost_each=50.0):
+        return pd.DataFrame([
+            {"condition_id": f"0x{i}", "direction": "BUY_YES", "cost_usdc": cost_each,
+             "category": f"cat-{i % 3}", "underlying": "BTC", "signal_source": "deribit",
+             "trade_type": "value", "event_slug": f"ev-{i}"}
+            for i in range(n)
+        ])
+
+    def test_underlying_bloqueia_quando_categoria_nao_bloquearia(self):
+        # 5 posições BTC de $50 = $250, espalhadas por 3 categorias — nenhuma
+        # categoria isolada passa de 30% de $1000, mas juntas são 25% do
+        # underlying BTC. Nova posição de $50 empurra para $300 = 30% > 15%.
+        open_pos = self._btc_positions(5)
+        ok, reason = risk_manager.check_exposure(
+            {"condition_id": "0xnew", "signal_source": "deribit", "trade_type": "value",
+             "category": "cat-9", "underlying": "BTC", "event_slug": "ev-novo"},
+            open_pos, {"initial_capital": 1000}, 50.0,
+        )
+        assert not ok and "underlying" in reason
+
+    def test_underlyings_diferentes_nao_se_bloqueiam(self):
+        open_pos = self._btc_positions(5)
+        ok, reason = risk_manager.check_exposure(
+            {"condition_id": "0xnew", "signal_source": "deribit", "trade_type": "value",
+             "category": "cat-9", "underlying": "ETH", "event_slug": "ev-novo"},
+            open_pos, {"initial_capital": 1000}, 50.0,
+        )
+        assert ok, reason
+
+    def test_denominador_usa_total_value_nao_initial_capital(self):
+        # Drawdown para $500: 2 posições BTC de $50 = $100 = 20% de $500 (já
+        # > 15%), mas só 10% de initial_capital=$1000 — sem total_value o
+        # bug antigo deixaria passar.
+        open_pos = self._btc_positions(2)
+        ok, reason = risk_manager.check_exposure(
+            {"condition_id": "0xnew", "signal_source": "deribit", "trade_type": "value",
+             "category": "cat-9", "underlying": "BTC", "event_slug": "ev-novo"},
+            open_pos, {"initial_capital": 1000}, 5.0, total_value=500.0,
+        )
+        assert not ok and "underlying" in reason
+
+
+class TestDirectionalSkew:
+    """P1-11e: 20 das 21 posições do livro real eram BUY_YES."""
+
+    def _positions(self, n_yes, n_no, trade_type="value"):
+        rows = [
+            {"condition_id": f"y{i}", "direction": "BUY_YES", "cost_usdc": 10.0,
+             "trade_type": trade_type, "event_slug": f"ev-y{i}"}
+            for i in range(n_yes)
+        ] + [
+            {"condition_id": f"n{i}", "direction": "BUY_NO", "cost_usdc": 10.0,
+             "trade_type": trade_type, "event_slug": f"ev-n{i}"}
+            for i in range(n_no)
+        ]
+        return pd.DataFrame(rows)
+
+    def test_livro_pequeno_nao_bloqueia_por_skew(self):
+        # 3 posições BUY_YES — abaixo de MIN_POSITIONS_FOR_SKEW_CHECK (5),
+        # não pode bloquear a 4ª só por ainda não ter diversidade.
+        open_pos = self._positions(n_yes=3, n_no=0)
+        ok, reason = risk_manager.check_exposure(
+            {"condition_id": "0xnew", "direction": "BUY_YES", "trade_type": "value",
+             "event_slug": "ev-novo"},
+            open_pos, {"initial_capital": 1000}, 10.0,
+        )
+        assert ok, reason
+
+    def test_livro_grande_e_desbalanceado_bloqueia_mesmo_lado(self):
+        # 6 BUY_YES + 1 BUY_NO (>= 5 direcionais) — mais um BUY_YES estoura
+        # MAX_DIRECTIONAL_SKEW_PCT (75%).
+        open_pos = self._positions(n_yes=6, n_no=1)
+        ok, reason = risk_manager.check_exposure(
+            {"condition_id": "0xnew", "direction": "BUY_YES", "trade_type": "value",
+             "event_slug": "ev-novo"},
+            open_pos, {"initial_capital": 1000}, 10.0,
+        )
+        assert not ok and "skew" in reason
+
+    def test_livro_desbalanceado_nao_bloqueia_lado_oposto(self):
+        # Mesmo livro, mas BUY_NO ajuda a equilibrar — não deve bloquear.
+        open_pos = self._positions(n_yes=6, n_no=1)
+        ok, reason = risk_manager.check_exposure(
+            {"condition_id": "0xnew", "direction": "BUY_NO", "trade_type": "value",
+             "event_slug": "ev-novo"},
+            open_pos, {"initial_capital": 1000}, 10.0,
+        )
+        assert ok, reason
+
+    def test_pernas_arb_nao_contam_no_skew(self):
+        # Livro majoritariamente BUY_YES, mas via arb (hedge estrutural) —
+        # não é uma aposta de direção, não deve entrar no cálculo.
+        open_pos = self._positions(n_yes=6, n_no=1, trade_type="arb")
+        ok, reason = risk_manager.check_exposure(
+            {"condition_id": "0xnew", "direction": "BUY_YES", "trade_type": "value",
+             "event_slug": "ev-novo"},
+            open_pos, {"initial_capital": 1000}, 10.0,
+        )
+        assert ok, reason
+
+
+class TestKellyCorrelacao:
+    """P1-11d: Kelly independente sobre apostas correlacionadas (mesmo
+    underlying) superaposta risco — escala por 1/n_correlated."""
+
+    def test_n_correlated_1_nao_muda_nada(self):
+        base = risk_manager.kelly_size(
+            edge=0.10, entry_price=0.20, capital=1000, confidence=1.0,
+            signal_source="odds", trade_type="value",
+        )
+        scaled = risk_manager.kelly_size(
+            edge=0.10, entry_price=0.20, capital=1000, confidence=1.0,
+            signal_source="odds", trade_type="value", n_correlated=1,
+        )
+        assert base == scaled
+
+    def test_terceira_posicao_no_mesmo_underlying_arrisca_um_terco(self):
+        # edge=0.08, p=0.10 (longe do KELLY_FULL_CAP e do pos_pct — isola a
+        # escala): sem correlação, $22.22; com n_correlated=3, $22.22/3=$7.41.
+        unscaled = risk_manager.kelly_size(
+            edge=0.08, entry_price=0.10, capital=1000, confidence=1.0,
+            signal_source="odds", trade_type="value",
+        )
+        scaled = risk_manager.kelly_size(
+            edge=0.08, entry_price=0.10, capital=1000, confidence=1.0,
+            signal_source="odds", trade_type="value", n_correlated=3,
+        )
+        assert abs(scaled - unscaled / 3) < 0.02
+
+    def test_rejeicao_por_correlacao_loga_motivo_distinto_de_kelly_pequeno(self, tmp_path, monkeypatch):
+        # P1-11d (revisão advisor): quando o Kelly some por causa de n_correlated
+        # (não por edge/capital pequenos), o log precisa dizer "correlacao",
+        # senão "kelly_pequeno" vira motivo genérico pra dois bugs diferentes.
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        from loguru import logger as loguru_logger
+
+        logged: list[str] = []
+        sink_id = loguru_logger.add(lambda msg: logged.append(str(msg)), level="INFO")
+
+        db = tmp_path / "paper.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(paper_trader.SCHEMA)
+        conn.execute("ALTER TABLE positions ADD COLUMN trade_type TEXT DEFAULT 'value'")
+        conn.execute("ALTER TABLE positions ADD COLUMN underlying TEXT DEFAULT ''")
+        conn.execute("INSERT INTO portfolio (initial_capital, current_cash) VALUES (30, 30)")
+        for i in range(2):
+            conn.execute("""
+                INSERT INTO positions
+                  (condition_id, question, underlying, direction, entry_price,
+                   shares, cost_usdc, status, trade_type, opened_at)
+                VALUES (?, 'BTC já aberto', 'btc', 'BUY_YES', 0.10, 10.0, 1.0,
+                        'open', 'value', '2026-01-01 00:00:00')
+            """, (f"0xopen{i}",))
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+        monkeypatch.setattr(paper_trader, "load_current_markets", lambda: pd.DataFrame())
+
+        portfolio = {"current_cash": 30.0}
+        # edge/capital pequenos o bastante pra só serem cortados quando divididos por n_correlated=3.
+        signal = {
+            "condition_id": "0xnovo", "question": "Bitcoin novo?", "underlying": "BTC",
+            "direction": "BUY_YES", "yes_price": 0.10, "edge": 0.05, "prob_yes": 0.15,
+            "confidence": 1.0, "signal_source": "deribit", "trade_type": "value", "spread": 0.01,
+        }
+        try:
+            result = paper_trader.open_position(portfolio, signal)
+        finally:
+            loguru_logger.remove(sink_id)
+        output = "".join(logged)
+
+        assert result is None
+        assert "correlacao n=3" in output
+        assert "kelly_pequeno" not in output
 
 
 class TestArbAlert:
