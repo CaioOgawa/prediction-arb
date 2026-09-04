@@ -8,6 +8,7 @@ Execução:
 """
 
 import glob
+import os
 import pickle
 import sqlite3
 import sys
@@ -40,6 +41,9 @@ from risk_manager import (  # noqa: E402
     WEEKLY_STOP_PCT,
     DAILY_STOP_PCT,
     EARLY_EXIT,
+    KELLY_MAX_FRAC,
+    MIN_EDGE_TO_TRADE,
+    MIN_EDGE_ABS,
 )
 
 st.set_page_config(
@@ -131,15 +135,33 @@ def load_early_exits() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=60)
+def _price_history_total_count() -> int:
+    """
+    P2-38: COUNT(*) em price_history é full table scan — com o histórico
+    voltando a crescer entre podas do db_maintenance, isso não pode rodar a
+    cada 5s (era chamado de dentro de ws_feed_status, no sidebar, todo render).
+    Isolado com TTL próprio de 60s; o resto de ws_feed_status usa índice
+    (MAX(id)/ORDER BY id) e continua barato o suficiente pra ficar em 5s.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()
+        total = row[0] if row else 0
+    except Exception:
+        total = 0
+    conn.close()
+    return total
+
+
 @st.cache_data(ttl=5)
 def ws_feed_status() -> dict:
     """Métricas detalhadas do ws_feed: ticks/s, latência estimada, status."""
+    total = _price_history_total_count()
     conn = sqlite3.connect(DB_PATH)
     try:
-        row = conn.execute(
-            "SELECT COUNT(*) as total, MAX(ts) as last_tick FROM price_history"
-        ).fetchone()
-        total, last_tick = row if row else (0, None)
+        row = conn.execute("SELECT MAX(ts) as last_tick FROM price_history").fetchone()
+        last_tick = row[0] if row else None
 
         # Ticks no último minuto (proxy de throughput)
         row2 = conn.execute(
@@ -156,7 +178,7 @@ def ws_feed_status() -> dict:
         last_ts_raw = row3[0] if row3 else None
 
     except Exception:
-        total, last_tick, ticks_last_min, last_ts_raw = 0, None, 0, None
+        last_tick, ticks_last_min, last_ts_raw = None, 0, None
     conn.close()
 
     alive     = False
@@ -183,22 +205,39 @@ def ws_feed_status() -> dict:
 
 
 @st.cache_data(ttl=5)
-def load_position_price_detail(condition_id: str) -> dict:
-    """Para uma posição aberta, retorna último bid/ask/mid do price_history."""
+def load_position_price_details(condition_ids: tuple[str, ...]) -> dict[str, dict]:
+    """
+    P2-38: última cotação de price_history por condition_id, em lote — as
+    páginas que listam posições abertas chamavam essa consulta 1-por-vez até
+    3x por posição, cada chamada abrindo sua própria conexão SQLite (40-60
+    conexões por render com ~21 posições abertas). Uma consulta, uma conexão,
+    todas as posições do render atual.
+    """
+    if not condition_ids:
+        return {}
     conn = sqlite3.connect(DB_PATH)
+    placeholders = ",".join("?" for _ in condition_ids)
     try:
-        row = conn.execute(
-            "SELECT best_bid, best_ask, mid, spread, ts FROM price_history "
-            "WHERE condition_id=? ORDER BY id DESC LIMIT 1",
-            (condition_id,),
-        ).fetchone()
+        rows = conn.execute(
+            f"""
+            SELECT ph.condition_id, ph.best_bid, ph.best_ask, ph.mid, ph.spread, ph.ts
+            FROM price_history ph
+            JOIN (
+                SELECT condition_id, MAX(id) AS max_id
+                FROM price_history
+                WHERE condition_id IN ({placeholders})
+                GROUP BY condition_id
+            ) latest ON ph.condition_id = latest.condition_id AND ph.id = latest.max_id
+            """,
+            condition_ids,
+        ).fetchall()
     except Exception:
-        row = None
+        rows = []
     conn.close()
-    if row:
-        return {"best_bid": row[0], "best_ask": row[1], "mid": row[2],
-                "spread": row[3], "ts": row[4]}
-    return {}
+    return {
+        r[0]: {"best_bid": r[1], "best_ask": r[2], "mid": r[3], "spread": r[4], "ts": r[5]}
+        for r in rows
+    }
 
 
 @st.cache_data(ttl=300)
@@ -242,10 +281,24 @@ def load_model_comparison() -> tuple[pd.DataFrame, str]:
 
 @st.cache_data(ttl=60)
 def load_log_tail(log_file: str, n: int = 100) -> str:
+    """
+    P2-38: lê só os últimos 64KB do arquivo, não o arquivo inteiro — com logs
+    de centenas de MB e seis chamadas por render na página de Logs,
+    read_text().splitlines() alocava várias centenas de MB por render.
+    100 linhas de log cabem folgado em 64KB; se não couberem, devolve menos
+    linhas em vez de ler o arquivo inteiro pra achar as que faltam.
+    """
     path = LOGS_DIR / log_file
     if not path.exists():
         return f"[arquivo não encontrado: {path}]"
-    lines = path.read_text(errors="replace").splitlines()
+    chunk = 65536
+    size = path.stat().st_size
+    with open(path, "rb") as f:
+        f.seek(-min(size, chunk), os.SEEK_END)
+        data = f.read()
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if size > chunk and lines:
+        lines = lines[1:]  # primeira linha pode estar cortada no meio
     return "\n".join(lines[-n:])
 
 
@@ -466,9 +519,13 @@ if page == "Visão Geral":
     # Posições abertas com múltiplos de exit em tempo real
     st.subheader("Posições Abertas")
     if not open_pos.empty:
+        # P2-38: uma consulta em lote pras N posições, não N conexões.
+        _cond_ids = tuple(sorted(open_pos["condition_id"].astype(str).unique()))
+        _price_details = load_position_price_details(_cond_ids)
+
         rows_enriched = []
         for _, pos in open_pos.iterrows():
-            live = load_position_price_detail(str(pos["condition_id"]))
+            live = _price_details.get(str(pos["condition_id"]), {})
             row  = {
                 "Questão":      str(pos.get("question", ""))[:45],
                 "Dir.":         pos.get("direction", ""),
@@ -503,7 +560,7 @@ if page == "Visão Geral":
         # Gauge de proximidade dos gatilhos de exit
         st.caption("Proximidade dos gatilhos de early exit (baseado em preço ao vivo)")
         for _, pos in open_pos.iterrows():
-            live = load_position_price_detail(str(pos["condition_id"]))
+            live = _price_details.get(str(pos["condition_id"]), {})
             if not live.get("best_bid"):
                 continue
             cost    = float(pos["cost_usdc"])
@@ -515,12 +572,16 @@ if page == "Visão Geral":
             cur_val  = exit_px * shares
             mult     = cur_val / cost if cost > 0 else 0
 
-            profit_pct = min(mult / 2.0, 1.0)   # 2× = 100%
+            # P2-39: 2.0 era hardcoded aqui — o profit target real vem de
+            # EARLY_EXIT por trade_type (2.5× value, 1.5× momentum).
+            _tt = str(pos.get("trade_type") or "value")
+            target_mult = float(EARLY_EXIT.get(_tt, {}).get("profit_target_mult", 2.0))
+            profit_pct = min(mult / target_mult, 1.0)
 
             q_short = str(pos.get("question", ""))[:35]
             col1, col2 = st.columns([2, 1])
             col1.caption(q_short)
-            col2.progress(profit_pct, text=f"Profit {mult:.1f}×/2×")
+            col2.progress(profit_pct, text=f"Profit {mult:.1f}×/{target_mult:.1f}×")
     else:
         st.info("Nenhuma posição aberta.")
 
@@ -729,9 +790,12 @@ elif page == "Feed ao Vivo":
     # Posições com monitoramento em tempo real e distância dos gatilhos
     st.subheader("Posições — Distância dos Gatilhos")
     if not open_pos.empty:
+        _cond_ids = tuple(sorted(open_pos["condition_id"].astype(str).unique()))
+        _price_details = load_position_price_details(_cond_ids)
+
         trigger_data = []
         for _, pos in open_pos.iterrows():
-            live = load_position_price_detail(str(pos["condition_id"]))
+            live = _price_details.get(str(pos["condition_id"]), {})
             cost    = float(pos["cost_usdc"])
             shares  = float(pos["shares"])
             entry   = float(pos["entry_price"])
@@ -747,15 +811,19 @@ elif page == "Feed ao Vivo":
 
                 yes_impl = (1.0 - bid) if direction == "BUY_NO" else bid
 
+                # P2-39: profit_target_mult vem do EARLY_EXIT por trade_type
+                # (2.0 era hardcoded — real é 2.5× value, 1.5× momentum).
+                _tt = str(pos.get("trade_type") or "value")
+                target_mult = float(EARLY_EXIT.get(_tt, {}).get("profit_target_mult", 2.0))
+
                 # Distância percentual de cada gatilho
-                dist_profit = (2.0 - mult) / 2.0     # 0 = no gatilho
+                dist_profit = (target_mult - mult) / target_mult     # 0 = no gatilho
 
                 # Edge flip relativo ao entry — delta vem do EARLY_EXIT por trade_type
                 # (fix 2026-07: EDGE_FLIP_DELTA solto não existia → NameError nesta aba)
                 # BUY_NO:  entry_yes = 1 - entry_price; gatilho em entry_yes + delta
                 # BUY_YES: entry_yes = entry_price;     gatilho em entry_yes - delta
                 entry_yes = (1.0 - entry) if direction == "BUY_NO" else entry
-                _tt = str(pos.get("trade_type") or "value")
                 flip_delta = float(EARLY_EXIT.get(_tt, {}).get("edge_flip_delta", 0.20))
                 if direction == "BUY_NO":
                     flip_trigger = entry_yes + flip_delta
@@ -774,6 +842,7 @@ elif page == "Feed ao Vivo":
                     "% p/ Profit":    max(dist_profit, 0),
                     "% p/ EdgeFlip":  max(1 - dist_edge, 0) if dist_edge is not None else 0,
                     "Último tick":    str(live.get("ts", ""))[:19],
+                    "_target_mult":   target_mult,
                 })
             else:
                 trigger_data.append({
@@ -783,6 +852,7 @@ elif page == "Feed ao Vivo":
                     "Spread (bps)": None, "% p/ Profit": None,
                     "% p/ EdgeFlip": None,
                     "Último tick": "sem dados",
+                    "_target_mult": None,
                 })
 
         df_trig = pd.DataFrame(trigger_data)
@@ -796,8 +866,12 @@ elif page == "Feed ao Vivo":
                 name="Múltiplo atual",
                 marker_color=["#2ecc71" if m >= 1 else "#e74c3c" for m in valid["Múltiplo"]],
             )
-            fig.add_hline(y=2.0, line_dash="dash", line_color="gold",
-                          annotation_text="Profit target 2×")
+            # P2-39: profit target não é um único 2.0 — value=2.5×,
+            # momentum=1.5×. Uma linha por alvo distinto entre as posições
+            # exibidas, em vez de uma constante errada pra todas.
+            for tm in sorted(valid["_target_mult"].dropna().unique()):
+                fig.add_hline(y=tm, line_dash="dash", line_color="gold",
+                              annotation_text=f"Profit target {tm:.1f}×")
             fig.add_hline(y=1.0, line_dash="dot", line_color="gray",
                           annotation_text="Break-even")
             fig.update_layout(
@@ -808,7 +882,7 @@ elif page == "Feed ao Vivo":
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        st.dataframe(df_trig, use_container_width=True)
+        st.dataframe(df_trig.drop(columns=["_target_mult"]), use_container_width=True)
     else:
         st.info("Nenhuma posição aberta.")
 
@@ -892,8 +966,9 @@ elif page == "Risco":
             st.info("Sem posições abertas.")
 
     st.subheader("Parâmetros de Risco Ativos")
+    _edge_por_fonte = ", ".join(f"{src} {v:.0%}" for src, v in sorted(MIN_EDGE_TO_TRADE.items()))
     params = {
-        "Kelly máximo":                  "25% (quarter-Kelly)",
+        "Kelly máximo":                  f"{KELLY_MAX_FRAC:.0%} (quarter-Kelly)",
         "Max por posição — momentum":    f"{MAX_POSITION_PCT['momentum']:.1%} do capital",
         "Max por posição — value":       f"{MAX_POSITION_PCT['value']:.1%} do capital",
         "Max por categoria":             f"{MAX_CATEGORY_PCT:.0%} do capital",
@@ -901,7 +976,8 @@ elif page == "Risco":
         "Max posições simultâneas":      f"{MAX_OPEN_POSITIONS} (momentum ≤ {MAX_MOMENTUM_POS}, value ≤ {MAX_VALUE_POS})",
         "Stop semanal":                  f"{WEEKLY_STOP_PCT:.0%} drawdown",
         "Stop diário":                   f"{DAILY_STOP_PCT:.0%} drawdown",
-        "Edge mínimo":                   "8%",
+        "Edge mínimo (piso absoluto)":   f"{MIN_EDGE_ABS:.0%}",
+        "Edge mínimo por fonte":         _edge_por_fonte,
         "Profit target — momentum":      f"{EARLY_EXIT['momentum']['profit_target_mult']}× custo",
         "Profit target — value":         f"{EARLY_EXIT['value']['profit_target_mult']}× custo",
         "Edge flip — momentum":          f"{EARLY_EXIT['momentum']['edge_flip_delta']:.0%} desde entry",
@@ -956,8 +1032,18 @@ elif page == "Sinais":
             fig = px.histogram(df, x="edge", nbins=30, template="plotly_dark",
                                labels={"edge": "Edge", "count": "N"},
                                title="Distribuição de Edge")
-            fig.add_vline(x=0.08, line_dash="dash", line_color="yellow",
-                          annotation_text="Mín. 8%")
+            # P2-39: 8% era hardcoded pra todas as fontes — o piso real varia
+            # por fonte (MIN_EDGE_TO_TRADE). Com filtro de fonte ativo, mostra
+            # o limiar daquela fonte; com "Todas" misturadas, mostra só o piso
+            # absoluto (MIN_EDGE_ABS), que é o único número comum a todas.
+            if sel_src != "Todas" and sel_src in MIN_EDGE_TO_TRADE:
+                threshold = MIN_EDGE_TO_TRADE[sel_src]
+                vline_label = f"Mín. {sel_src} {threshold:.0%}"
+            else:
+                threshold = MIN_EDGE_ABS
+                vline_label = f"Piso abs. {threshold:.0%} (varia por fonte — ver Risco)"
+            fig.add_vline(x=threshold, line_dash="dash", line_color="yellow",
+                          annotation_text=vline_label)
             fig.update_layout(height=250, margin=dict(l=0, r=0, t=30, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
