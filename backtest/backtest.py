@@ -230,23 +230,43 @@ def confidence_accuracy(closed: pd.DataFrame, n_bins: int = 4) -> pd.DataFrame:
     return acc
 
 
-def sharpe_ratio(closed: pd.DataFrame, initial_capital: float = 1000.0) -> float:
+def sharpe_ratio(closed: pd.DataFrame, initial_capital: float = 1000.0) -> tuple[float, float]:
     """
     Sharpe ratio anualizado usando retornos diários de P&L realizado.
     Assume risk-free = 0 (crypto context).
+
+    P2-35: groupby("date") só produz linha pra dia com fechamento — dias sem
+    fechamento SOMEM da série em vez de zerarem, então a média/desvio saem
+    calculados sobre poucas dezenas de observações e depois escalados por
+    √252 como se houvesse 252 dias assim. Se 44 trades fecham em ~12 dias
+    distintos ao longo de 2 meses, o Sharpe sai inflado por ~√(252/dias
+    corridos). reindex sobre o range completo (primeiro→último fechamento),
+    zero-fill nos dias sem trade, corrige isso.
+
+    Returns:
+        (sharpe, standard_error) — SE de um Sharpe amostral é
+        aproximadamente sqrt((1 + sharpe²/2) / n); com n pequeno (poucas
+        dezenas de trades, típico neste sistema) o SE costuma ser maior que
+        o próprio Sharpe — motivo pra reportar os dois, nunca só o ponto.
     """
     if closed.empty:
-        return float("nan")
+        return float("nan"), float("nan")
 
     df = closed[["closed_at", "pnl_usdc"]].copy()
-    df["date"] = df["closed_at"].dt.date
+    df["date"] = pd.to_datetime(df["closed_at"]).dt.normalize()
     daily_pnl = df.groupby("date")["pnl_usdc"].sum()
 
-    daily_ret = daily_pnl / initial_capital
-    if len(daily_ret) < 2 or daily_ret.std() == 0:
-        return float("nan")
+    full_range = pd.date_range(daily_pnl.index.min(), daily_pnl.index.max(), freq="D")
+    daily_pnl = daily_pnl.reindex(full_range, fill_value=0.0)
 
-    return float(daily_ret.mean() / daily_ret.std() * np.sqrt(252))
+    daily_ret = daily_pnl / initial_capital
+    n = len(daily_ret)
+    if n < 2 or daily_ret.std() == 0:
+        return float("nan"), float("nan")
+
+    sharpe = float(daily_ret.mean() / daily_ret.std() * np.sqrt(252))
+    se = float(np.sqrt((1 + sharpe**2 / 2) / n))
+    return sharpe, se
 
 
 def max_drawdown(closed: pd.DataFrame) -> float:
@@ -315,6 +335,16 @@ def summary_stats(
     n_closed = len(closed)
     n_wins   = int((closed["pnl_usdc"] > 0).sum()) if not closed.empty else 0
 
+    # P2-35/P2-36: Sharpe de poucos fechamentos é ruído puro — o gate era
+    # n_closed >= 5, e um Sharpe de 5 trades não diz nada. 30 ainda é pouco
+    # (o SE devolvido por sharpe_ratio deixa isso explícito), mas é o piso
+    # onde o número para de ser majoritariamente artefato de amostra.
+    MIN_CLOSED_FOR_SHARPE = 30
+    sharpe = sharpe_se = None
+    if n_closed >= MIN_CLOSED_FOR_SHARPE:
+        sharpe, sharpe_se = sharpe_ratio(closed, initial)
+        sharpe, sharpe_se = round(sharpe, 3), round(sharpe_se, 3)
+
     return {
         "initial_capital":   initial,
         "current_cash":      cash,
@@ -327,7 +357,8 @@ def summary_stats(
         "total_return_pct":  round(total_return_pct, 2),
         "win_rate":          round(n_wins / n_closed, 3) if n_closed > 0 else None,
         "n_wins":            n_wins,
-        "sharpe":            round(sharpe_ratio(closed, initial), 3) if n_closed >= 5 else None,
+        "sharpe":            sharpe,
+        "sharpe_se":         sharpe_se,
         "max_drawdown_usdc": round(max_drawdown(closed), 2),
     }
 
@@ -513,7 +544,7 @@ def generate_html_report(
         card("Posições Abertas", str(stats["open_positions"])),
         card("Posições Fechadas", str(stats["closed_positions"])),
         card("Win Rate",         f"{stats['win_rate']:.1%}" if stats["win_rate"] is not None else "—"),
-        card("Sharpe (anual.)",  f"{stats['sharpe']:.2f}" if stats["sharpe"] is not None else "—"),
+        card("Sharpe (anual.)",  f"{stats['sharpe']:.2f} ± {stats['sharpe_se']:.2f}" if stats["sharpe"] is not None else "—"),
         card("Max Drawdown",     f"${stats['max_drawdown_usdc']:.2f}", "#ff6b6b" if stats["max_drawdown_usdc"] < 0 else "#e9ecef"),
     ])
 
@@ -624,7 +655,10 @@ def print_backtest_summary(
 
     if stats["sharpe"] is not None:
         sh_color = "green" if stats["sharpe"] >= 1 else "yellow" if stats["sharpe"] >= 0 else "red"
-        console.print(f"  Sharpe anualiz.:  [{sh_color}]{stats['sharpe']:>10.2f}[/{sh_color}]")
+        console.print(
+            f"  Sharpe anualiz.:  [{sh_color}]{stats['sharpe']:>10.2f}[/{sh_color}] "
+            f"± {stats['sharpe_se']:.2f}"
+        )
 
     if stats["max_drawdown_usdc"] < 0:
         console.print(f"  Max drawdown:     [red]${stats['max_drawdown_usdc']:>+.2f}[/red]")

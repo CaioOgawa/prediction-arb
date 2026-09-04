@@ -56,6 +56,9 @@ def _as_list(raw) -> list:
 KEEP_COLS = [
     "id", "conditionId", "question", "category", "volume", "liquidity",
     "endDate", "active", "closed", "archived",
+    # P2-34: sem isso, quem consome o snapshot (sim_backtest.py) não tem como
+    # filtrar mercado que ainda nem existia em ts — look-ahead duro.
+    "startDate", "createdAt",
     "outcomePrices", "outcomes", "clobTokenIds",
     "restricted", "resolutionSource", "description",
     # Campos de preço em tempo real (presentes apenas em mercados CLOB ativos)

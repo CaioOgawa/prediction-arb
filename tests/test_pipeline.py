@@ -424,8 +424,14 @@ class TestDbMaintenance:
 
         old_resolved = raw / "resolved_markets_v2_20260401_000000.parquet"
         self._touch(old_resolved, days_old=200)
-        old_snapshot = raw / "markets_all_20260101_000000.parquet"
-        self._touch(old_snapshot, days_old=30)
+        old_incremental = raw / "markets_incremental_20260101_000000.parquet"
+        self._touch(old_incremental, days_old=30)
+        # markets_all_* fora de RAW_MARKET_PATTERNS de propósito — sim_backtest.py
+        # lê o mais VELHO desses de propósito (janela histórica walk-forward);
+        # apagar por idade já destruiu essa janela uma vez (2026-09-04) sem
+        # nenhum arquivamento equivalente pra recuperar depois.
+        old_full_snapshot = raw / "markets_all_20260101_000000.parquet"
+        self._touch(old_full_snapshot, days_old=30)
 
         result = db_maintenance.prune_report_files(
             reports_dir=reports, raw_markets_dir=raw, days=14, dry_run=False,
@@ -435,7 +441,8 @@ class TestDbMaintenance:
         assert new_eda.exists()
         assert old_unrelated.exists()      # padrão desconhecido — nunca apagado
         assert old_resolved.exists()       # dataset do ml_lab — fora dos padrões, nunca apagado
-        assert not old_snapshot.exists()
+        assert not old_incremental.exists()
+        assert old_full_snapshot.exists()  # markets_all_* nunca é apagado automaticamente
         assert result["files_removed"] == 2
 
     def test_prune_report_files_dry_run_nao_apaga(self, tmp_path):

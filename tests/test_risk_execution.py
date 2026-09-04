@@ -20,6 +20,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -792,6 +793,7 @@ class TestKelly:
 
 sys.path.insert(0, str(ROOT / "backtest"))
 import sim_backtest
+import backtest as live_backtest
 
 
 class TestSimBacktestKellyParity:
@@ -829,6 +831,224 @@ class TestSimBacktestKellyParity:
         # piso, que antes não existia aqui (P2-33 nota isso como lacuna).
         sim = self._sim()
         assert sim._kelly_size(entry_price=0.50, prob=0.53) == 0.0  # edge=0.03
+
+
+class TestSimBacktestLookAheadEMtM:
+    """P2-34/P2-35: sim_backtest.py negociava mercado que ainda nem existia
+    em ts (look-ahead duro) e marcava posição aberta a custo em vez de a
+    mercado (Sharpe inflado por construção)."""
+
+    def _sim(self, capital=1000.0, discount=0.20):
+        return sim_backtest.WalkForwardSimulator(
+            sim_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            sim_end=datetime(2026, 2, 1, tzinfo=timezone.utc),
+            initial_capital=capital,
+            market_discount=discount,
+        )
+
+    def test_mercado_sem_created_at_nao_bloqueia(self):
+        # Snapshot anterior ao P2-34 — created_at é None, não dá pra saber,
+        # não trava a simulação inteira.
+        mkt = pd.Series({"created_at": None})
+        ts = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        assert sim_backtest.WalkForwardSimulator._is_market_open_at(mkt, ts)
+
+    def test_bloqueia_antes_do_created_at(self):
+        mkt = pd.Series({"created_at": datetime(2026, 6, 1, tzinfo=timezone.utc)})
+        ts = datetime(2026, 1, 15, tzinfo=timezone.utc)  # antes de existir
+        assert not sim_backtest.WalkForwardSimulator._is_market_open_at(mkt, ts)
+
+    def test_libera_depois_do_created_at(self):
+        mkt = pd.Series({"created_at": datetime(2026, 1, 1, tzinfo=timezone.utc)})
+        ts = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        assert sim_backtest.WalkForwardSimulator._is_market_open_at(mkt, ts)
+
+    def test_mark_open_positions_usa_prob_do_dia_nao_custo(self, monkeypatch):
+        sim = self._sim(discount=0.0)  # sem desconto — mtm_price == prob
+        pos = sim_backtest.SimPosition(
+            market_id="0xa", question="Teste?", asset="BTC", strike=70_000.0,
+            direction="above", is_touch=False, side="BUY_YES",
+            entry_ts=datetime(2026, 1, 1, tzinfo=timezone.utc), entry_prob=0.50,
+            entry_price=0.50, cost_usdc=50.0, shares=100.0,
+            end_date=datetime(2026, 3, 1, tzinfo=timezone.utc), resolved_yes=None,
+        )
+        sim.open_positions = [pos]
+        monkeypatch.setattr(sim, "_compute_prob", lambda *a, **kw: 0.80)
+
+        ts = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        # Antes do fix: open_value == cost_usdc (50.0), fixo, todo dia.
+        # Depois: shares × prob_do_dia = 100 × 0.80 = 80.0 — bem diferente
+        # do custo, prova que está marcando a mercado.
+        assert sim._mark_open_positions(ts) == pytest.approx(80.0)
+
+    def test_mark_open_positions_cai_pro_custo_sem_spot_iv(self, monkeypatch):
+        # _compute_prob devolve None quando spot/IV não estão disponíveis em
+        # ts (ex: fora da janela de 365d do CoinGecko/DVOL) — degrada pro
+        # custo em vez de quebrar ou zerar a posição.
+        sim = self._sim()
+        pos = sim_backtest.SimPosition(
+            market_id="0xa", question="Teste?", asset="BTC", strike=70_000.0,
+            direction="above", is_touch=False, side="BUY_YES",
+            entry_ts=datetime(2026, 1, 1, tzinfo=timezone.utc), entry_prob=0.50,
+            entry_price=0.50, cost_usdc=50.0, shares=100.0,
+            end_date=datetime(2026, 3, 1, tzinfo=timezone.utc), resolved_yes=None,
+        )
+        sim.open_positions = [pos]
+        monkeypatch.setattr(sim, "_compute_prob", lambda *a, **kw: None)
+
+        ts = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        assert sim._mark_open_positions(ts) == pytest.approx(100.0 * 0.50)
+
+
+class TestLoadSimMarkets:
+    """P2-34: terceira convenção de seleção de parquet do sistema
+    (sorted(*.parquet)[0] por ordem alfabética, misturando prefixos
+    diferentes) — padronizada pra mtime, mas deliberadamente o mais VELHO
+    markets_all_*, não o mais novo (único consumidor que quer a janela
+    histórica mais ampla). Ver nota em db_maintenance.py sobre por que
+    markets_all_* fica fora da retenção automática."""
+
+    def _write_parquet(self, path, end_date="2026-12-31T00:00:00Z", with_enddate=True, question="Will Bitcoin reach $70,000 by December 31, 2026?"):
+        row = {"question": question, "conditionId": "0xabc", "outcomePrices": None}
+        if with_enddate:
+            row["endDate"] = end_date
+        pd.DataFrame([row]).to_parquet(path)
+
+    def test_pega_o_markets_all_mais_velho_por_mtime(self, tmp_path):
+        import os
+        older = tmp_path / "markets_all_20260101_000000.parquet"
+        newer = tmp_path / "markets_all_20260601_000000.parquet"
+        self._write_parquet(newer)
+        self._write_parquet(older)
+        # Nomeação por si só sugeriria "older" primeiro (ordem alfabética
+        # bate com o timestamp aqui) — força mtimes na ordem inversa do
+        # nome pra provar que é mtime decidindo, não a string do arquivo.
+        now = __import__("time").time()
+        os.utime(newer, (now - 100, now - 100))
+        os.utime(older, (now, now))
+
+        result = sim_backtest.load_sim_markets(markets_dir=tmp_path)
+        assert not result.empty
+        assert result.iloc[0]["created_at"] is None  # sem startDate/createdAt no fixture
+
+    def test_ignora_prefixo_diferente_de_markets_all(self, tmp_path):
+        # markets_incremental_*/resolved_markets_* não entram no glob restrito
+        # — só markets_all_* é considerado pra essa seleção.
+        self._write_parquet(tmp_path / "markets_incremental_20250101_000000.parquet")
+        self._write_parquet(tmp_path / "resolved_markets_20250101_000000.parquet")
+
+        with pytest.raises(RuntimeError):
+            sim_backtest.load_sim_markets(markets_dir=tmp_path)
+
+    def test_extrai_created_at_quando_presente(self, tmp_path):
+        path = tmp_path / "markets_all_20260101_000000.parquet"
+        row = {
+            "question": "Will Bitcoin reach $70,000 by December 31, 2026?", "conditionId": "0xabc",
+            "endDate": "2026-12-31T00:00:00Z", "startDate": "2026-01-01T00:00:00Z",
+            "outcomePrices": None,
+        }
+        pd.DataFrame([row]).to_parquet(path)
+
+        result = sim_backtest.load_sim_markets(markets_dir=tmp_path)
+        assert not result.empty
+        assert result.iloc[0]["created_at"] == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+class TestBacktestSharpeRatio:
+    """P2-35: groupby("date") só produz linha pra dia com fechamento — dias
+    sem fechamento somem em vez de zerarem, então a média/desvio saem de
+    poucas dezenas de observações e são escalados por √252 como se
+    houvesse 252 dias assim. Sharpe superestimado por ~√(252/dias corridos)."""
+
+    def _closed(self, rows):
+        return pd.DataFrame(rows)
+
+    def test_vazio_da_nan_nan(self):
+        sharpe, se = live_backtest.sharpe_ratio(pd.DataFrame(columns=["closed_at", "pnl_usdc"]))
+        assert np.isnan(sharpe) and np.isnan(se)
+
+    def test_preenche_dias_sem_fechamento_com_zero(self):
+        # 2 trades no mesmo dia, depois nada por 59 dias, depois 1 trade —
+        # groupby("date") sozinho enxergaria só 2 observações; reindexado
+        # sobre o range completo (61 dias) a série tem 61 pontos.
+        rows = [
+            {"closed_at": pd.Timestamp("2026-01-01"), "pnl_usdc": 10.0},
+            {"closed_at": pd.Timestamp("2026-01-01"), "pnl_usdc": -5.0},
+            {"closed_at": pd.Timestamp("2026-03-02"), "pnl_usdc": 8.0},
+        ]
+        closed = self._closed(rows)
+        df = closed.copy()
+        df["date"] = pd.to_datetime(df["closed_at"]).dt.normalize()
+        daily_pnl = df.groupby("date")["pnl_usdc"].sum()
+        n_dias_com_trade = len(daily_pnl)
+        full_range_len = (
+            pd.to_datetime(df["closed_at"]).max() - pd.to_datetime(df["closed_at"]).min()
+        ).days + 1
+
+        assert n_dias_com_trade == 2  # o bug: só 2 observações
+        assert full_range_len == 61   # o fix: 61 dias corridos, a maioria zero
+
+    def test_sharpe_menor_com_reindex_do_que_sem(self):
+        # Mesmo P&L, mas concentrado em poucos dias — o Sharpe reindexado
+        # (com zeros nos dias sem trade) tem que ser MENOR que o cálculo
+        # ingênuo sobre só os dias com fechamento, porque a variância dos
+        # zeros intercalados infla o desvio-padrão da série completa.
+        rows = [
+            {"closed_at": pd.Timestamp("2026-01-01"), "pnl_usdc": 10.0},
+            {"closed_at": pd.Timestamp("2026-01-02"), "pnl_usdc": 12.0},
+            {"closed_at": pd.Timestamp("2026-01-03"), "pnl_usdc": 9.0},
+        ]
+        closed = self._closed(rows)
+        sharpe_reindexado, se = live_backtest.sharpe_ratio(closed, initial_capital=1000.0)
+
+        # Cálculo ingênuo (o bug): só os 3 dias com trade, sem gap nenhum
+        # nesse caso — os dois deveriam BATER quando não há gap real.
+        df = closed.copy()
+        df["date"] = pd.to_datetime(df["closed_at"]).dt.normalize()
+        daily_pnl = df.groupby("date")["pnl_usdc"].sum()
+        daily_ret = daily_pnl / 1000.0
+        sharpe_ingenuo = float(daily_ret.mean() / daily_ret.std() * np.sqrt(252))
+
+        assert sharpe_reindexado == pytest.approx(sharpe_ingenuo)  # sem gap, sem diferença
+
+        # Agora com gap: mesmos 3 trades, mas o último 30 dias depois. Compara
+        # o reindexado contra o ingênuo NOS MESMOS dados com gap — se alguém
+        # remover o reindex, o ingênuo e o "fixed" viram a mesma conta e o
+        # teste falha (ao contrário de comparar datasets diferentes).
+        rows_com_gap = rows[:2] + [{"closed_at": pd.Timestamp("2026-01-31"), "pnl_usdc": 9.0}]
+        gapped = self._closed(rows_com_gap)
+        sharpe_fixed, _ = live_backtest.sharpe_ratio(gapped, initial_capital=1000.0)
+
+        df = gapped.copy()
+        df["date"] = pd.to_datetime(df["closed_at"]).dt.normalize()
+        daily_ret_gap = df.groupby("date")["pnl_usdc"].sum() / 1000.0
+        sharpe_naive_gap = float(daily_ret_gap.mean() / daily_ret_gap.std() * np.sqrt(252))
+
+        assert sharpe_fixed < sharpe_naive_gap
+
+    def test_devolve_standard_error(self):
+        rows = [
+            {"closed_at": pd.Timestamp("2026-01-01") + pd.Timedelta(days=i), "pnl_usdc": 5.0 if i % 2 == 0 else -3.0}
+            for i in range(10)
+        ]
+        sharpe, se = live_backtest.sharpe_ratio(self._closed(rows), initial_capital=1000.0)
+        assert not np.isnan(sharpe)
+        expected_se = np.sqrt((1 + sharpe**2 / 2) / 10)
+        assert se == pytest.approx(expected_se)
+
+    def test_gate_de_30_fechamentos_suprime_sharpe(self):
+        # P2-35/P2-36: Sharpe de poucos trades é ruído — o gate era n>=5,
+        # subiu pra 30. Com 10 fechamentos, sharpe/sharpe_se saem None.
+        closed = self._closed([
+            {
+                "closed_at": pd.Timestamp("2026-01-01") + pd.Timedelta(days=i),
+                "pnl_usdc": 5.0, "condition_id": f"0x{i}",
+            }
+            for i in range(10)
+        ])
+        stats = live_backtest.summary_stats(closed, pd.DataFrame(), {"initial_capital": 1000.0, "current_cash": 1000.0})
+        assert stats["sharpe"] is None
+        assert stats["sharpe_se"] is None
 
 
 # ──────────────────────────────────────────────────────────

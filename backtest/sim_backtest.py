@@ -170,10 +170,19 @@ def load_sim_markets(markets_dir: Path = MARKETS_DIR) -> pd.DataFrame:
     Carrega mercados BTC/ETH parseáveis dos arquivos parquet brutos da Gamma API.
     Retorna DataFrame com colunas:
       market_id, question, asset, strike, expiry, direction, is_touch,
-      end_date, resolved_yes (0/1/None), yes_price_current
+      end_date, created_at, resolved_yes (0/1/None), yes_price_current
+
+    P2-34: usa o parquet MAIS VELHO disponível (não o mais recente) — este é
+    o único consumidor do sistema que quer a janela histórica mais ampla
+    possível pra simulação walk-forward, ao contrário de
+    load_current_markets()/dashboard, que sempre querem o mais recente. Por
+    isso markets_all_*.parquet fica de fora da retenção automática do
+    db_maintenance.py (achado em 2026-09-04: uma rodada de retenção sem essa
+    exceção apagou a janela histórica original sem arquivamento equivalente).
     """
-    # Usa o primeiro parquet bruto (maior, com metadados completos)
-    raw_files = sorted(markets_dir.glob("*.parquet"))
+    raw_files = sorted(
+        markets_dir.glob("markets_all_*.parquet"), key=lambda p: p.stat().st_mtime,
+    )
     raw_files_with_enddate = []
     for f in raw_files:
         try:
@@ -210,6 +219,15 @@ def load_sim_markets(markets_dir: Path = MARKETS_DIR) -> pd.DataFrame:
         except (ValueError, AttributeError):
             end_date = parsed["expiry"]
 
+        # P2-34: startDate/createdAt só existem em snapshots coletados depois
+        # do fix (2026-09-04) — None aqui é "não sei quando abriu", não "abriu
+        # antes de qualquer coisa". run() trata os dois casos diferente.
+        created_at_str = row.get("startDate") or row.get("createdAt") or ""
+        try:
+            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            created_at = None
+
         # Resolução: outcomePrices[0] ≈ 1 → YES, ≈ 0 → NO
         resolved_yes = None
         prices_raw = row.get("outcomePrices")
@@ -231,6 +249,7 @@ def load_sim_markets(markets_dir: Path = MARKETS_DIR) -> pd.DataFrame:
             "strike":          parsed["strike"],
             "expiry":          parsed["expiry"],   # parsed (pode ter ano errado)
             "end_date":        end_date,            # da API (autoritativo)
+            "created_at":      created_at,           # None se o snapshot for anterior ao P2-34
             "direction":       parsed["direction"],
             "is_touch":        parsed["is_touch"],
             "resolved_yes":    resolved_yes,
@@ -324,6 +343,40 @@ class WalkForwardSimulator:
         self.markets: pd.DataFrame        = pd.DataFrame()
 
     # ── Helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _is_market_open_at(mkt: "pd.Series", ts: datetime) -> bool:
+        """
+        P2-34: sem isso, mercado criado em novembro é negociável desde abril
+        — look-ahead duro, condiciona no futuro. mkt["created_at"] é None em
+        snapshots coletados antes do P2-34 (2026-09-04) — não bloqueia
+        (não dá pra saber), em vez de vetar a simulação inteira até um
+        snapshot novo com startDate/createdAt ser coletado.
+        """
+        created_at = mkt.get("created_at")
+        if created_at is None or pd.isna(created_at):
+            return True
+        return bool(ts >= created_at)
+
+    def _mark_open_positions(self, ts: datetime) -> float:
+        """
+        P2-35: marcar posições abertas a custo (cost_usdc fixo) deixa a
+        curva de P&L constante por partes, só pulando nas saídas —
+        subestima a volatilidade diária e infla o Sharpe por construção (o
+        max_dd calculado em cima também ignora toda excursão não
+        realizada). Reusa _compute_prob, já chamado no mesmo loop pra
+        fechamentos forçados no fim da simulação.
+        """
+        total = 0.0
+        for p in self.open_positions:
+            prob = self._compute_prob(p.asset, p.strike, p.direction == "above", p.is_touch, ts, p.end_date)
+            if prob is not None:
+                fair = prob if p.side == "BUY_YES" else (1.0 - prob)
+                mtm_price = max(0.01, fair * (1.0 - self.market_discount))
+            else:
+                mtm_price = p.entry_price  # sem spot/IV disponível em ts — mantém ao custo
+            total += p.shares * mtm_price
+        return total
 
     def _get_spot(self, asset: str, ts: datetime) -> Optional[float]:
         """Spot price mais recente disponível em ts."""
@@ -616,6 +669,8 @@ class WalkForwardSimulator:
                     continue   # sem re-entrada após fechar
                 if ts >= mkt["end_date"]:
                     continue
+                if not self._is_market_open_at(mkt, ts):
+                    continue
 
                 pos = self._try_open(mkt, ts)
                 if pos is not None:
@@ -628,11 +683,9 @@ class WalkForwardSimulator:
                             f"(prob={pos.entry_prob:.3f})"
                         )
 
-            # 3. Registra ponto na curva de P&L
-            open_value = sum(
-                p.cost_usdc  # simplificado: sem MtM intraday
-                for p in self.open_positions
-            )
+            # 3. Registra ponto na curva de P&L — marcado a mercado, não a
+            # custo (P2-35, ver _mark_open_positions).
+            open_value = self._mark_open_positions(ts)
             self.pnl_curve.append({
                 "date":          ts.date(),
                 "cash":          round(self.cash, 2),

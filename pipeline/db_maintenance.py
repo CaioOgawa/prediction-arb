@@ -51,8 +51,16 @@ REPORT_PATTERNS = [
     "eda_markets_*.csv", "top_markets_*.csv", "portfolio_*.csv",
     "signals_odds_*.csv", "signals_deribit_*.csv", "signals_structural_*.csv",
 ]
+# markets_all_*.parquet propositalmente FORA desta lista (achado depois de uma
+# rodada real de retenção em 2026-09-04): load_current_markets() só quer o
+# mais novo, mas backtest/sim_backtest.py::load_sim_markets() lê o mais VELHO
+# de propósito (simulação walk-forward histórica) — os dois consumidores
+# discordam sobre qual ponta descartar, e apagar por idade destruiu a janela
+# histórica original sem nenhum arquivamento equivalente pra recuperar depois.
+# markets_incremental_*/partial_all_* não têm esse problema (só load_current_
+# markets os lê, sempre pelo mais novo).
 RAW_MARKET_PATTERNS = [
-    "markets_all_*.parquet", "markets_incremental_*.parquet", "markets_partial_all_*.parquet",
+    "markets_incremental_*.parquet", "markets_partial_all_*.parquet",
 ]
 
 
