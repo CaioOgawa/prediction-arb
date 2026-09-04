@@ -153,31 +153,36 @@ _DATE_PATTERN = re.compile(
     r"(?:on\s+|by\s+|before\s+)?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2})(?:,?\s*(?P<year>\d{4}))?",
     re.IGNORECASE,
 )
-_PRICE_PATTERN = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)[kK]?", re.IGNORECASE)
+_PRICE_PATTERN = re.compile(r"\$\s*(?P<num>[\d,]+(?:\.\d+)?)\s*(?P<suf>[kKmM])?\b")
 _BETWEEN_PATTERN = re.compile(r"between", re.IGNORECASE)
+
+_SUFFIX_MULT = {"k": 1_000, "m": 1_000_000}
 
 
 def _parse_strike(text: str) -> float | None:
-    """Extrai o valor de strike da pergunta. Ex: '$68,000' → 68000.0, '$100k' → 100000.0"""
-    matches = _PRICE_PATTERN.findall(text)
-    if not matches:
-        return None
-    # Para "between $X and $Y", retorna o ponto médio
-    values = []
-    for m in matches:
-        raw = m.replace(",", "").strip()
-        val = float(raw)
-        if text.lower().find(m) > 0:
-            context = text.lower()[max(0, text.lower().find(m)-2):text.lower().find(m)+2]
-            if "k" in context:
-                val *= 1000
-        # Trata sufixo k/K no match
-        idx = text.lower().find(m.lower().replace(",", ""))
-        if idx >= 0 and idx + len(m) < len(text) and text[idx + len(m)].lower() == "k":
-            val *= 1000
-        values.append(val)
+    """
+    Extrai o valor de strike da pergunta. Ex: '$68,000' → 68000.0, '$100k' → 100000.0.
 
-    return float(np.mean(values)) if values else None
+    P0-4: a versão antiga tinha duas regras de ×1000 sobrepostas (janela de
+    ±2 caracteres + checagem de sufixo) que disparavam as DUAS para números de
+    um dígito, multiplicando por 1000 duas vezes: "$3k" virava 3.000.000 em vez
+    de 3.000. O sufixo agora entra na própria captura do regex e multiplica
+    exatamente uma vez.
+
+    Pergunta com múltiplos preços (ex: "between $X and $Y") não tem um strike
+    único e não-ambíguo — rejeita em vez de inventar uma média. Foi uma média
+    assim que produziu o strike de 3.000.000 usado no único "arb garantido"
+    (falso) já executado em produção.
+    """
+    matches = _PRICE_PATTERN.findall(text)
+    if len(matches) != 1:
+        return None
+
+    num_raw, suffix = matches[0]
+    val = float(num_raw.replace(",", ""))
+    if suffix:
+        val *= _SUFFIX_MULT[suffix.lower()]
+    return val
 
 
 def _parse_expiry(text: str, reference_year: int | None = None) -> datetime | None:
@@ -252,7 +257,7 @@ def _detect_direction(text: str) -> tuple[str | None, bool]:
     return None, False
 
 
-def parse_crypto_market(question: str) -> dict | None:
+def parse_crypto_market(question: str, spot: float | None = None) -> dict | None:
     """
     Extrai (asset, strike, expiry, direction, is_touch) de uma pergunta Polymarket.
     Retorna None se não conseguir parsear com confiança.
@@ -263,6 +268,17 @@ def parse_crypto_market(question: str) -> dict | None:
       "Will Bitcoin hit $150k by December 31, 2026?"               → touch/barreira
       "Will the price of Ethereum be greater than $2,500 on April 2?"
       "Will the price of Bitcoin be less than $62,000 on April 1?"
+
+    spot: preço à vista atual do ativo, se disponível. Para mercados de touch,
+    a direção real é dada pelo strike vs. spot ATUAL, não pela keyword da
+    pergunta — "Will BTC hit $50k?" com spot em $100k é barreira DOWNWARD (o
+    preço precisa CAIR até 50k), mas "hit/reach" por si só sugere upward.
+    Usar a keyword sozinha classificava esse caso como upward, e a fórmula
+    upward com K < S satura em P≈1 (BUY_YES espúrio — auditoria 2026-07).
+    Sem spot, fica a direção inferida por keyword (é o que P0-4 corrigiu no
+    parser de strike, mas a correção de direção por spot é P0-4 correlato —
+    todo consumidor que tiver spot disponível deve passá-lo aqui, em vez de
+    reimplementar "strike > spot" no próprio call site).
     """
     asset              = _detect_asset(question)
     direction, is_touch = _detect_direction(question)
@@ -273,6 +289,9 @@ def parse_crypto_market(question: str) -> dict | None:
         return None
     if strike <= 0:
         return None
+
+    if is_touch and spot is not None and spot > 0:
+        direction = "above" if strike > spot else "below"
 
     return {
         "asset":      asset,
@@ -608,10 +627,13 @@ def run(
         if spot is None or not opts:
             continue
 
-        # Touch/barreira: a direção é dada pelo strike vs. spot ATUAL, não por keyword.
-        # "Will BTC hit $50k?" com spot em $100k é barreira DOWNWARD (o preço precisa
-        # CAIR até 50k). Keywords como "hit/reach" classificavam tudo como upward,
-        # e a fórmula upward com K < S retorna P≈1 → BUY_YES espúrio (auditoria 2026-07).
+        # Touch/barreira: a direção real é dada pelo strike vs. spot ATUAL, não
+        # pela keyword da primeira parse — spot só fica disponível depois
+        # (duas passadas: parse geral, depois busca de spot por ativo). A
+        # MESMA regra agora mora em parse_crypto_market (P0-4 correlato) para
+        # que outros consumidores com spot disponível NO MOMENTO DO PARSE
+        # (como structural_arb) herdem automaticamente — aqui, sem spot na
+        # primeira passada, aplica-se direto sobre os valores já extraídos.
         if is_touch:
             direction = "above" if strike > spot else "below"
             parsed["direction"] = direction

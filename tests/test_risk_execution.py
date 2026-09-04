@@ -295,6 +295,77 @@ class TestTouchDirection:
 
 
 # ──────────────────────────────────────────────────────────
+# deribit_collector — _parse_strike (P0-4: "$3k" virava 3.000.000, erro 1000×)
+# ──────────────────────────────────────────────────────────
+
+class TestParseStrike:
+    """Tabela de repro da auditoria: duas regras de ×1000 sobrepostas disparavam
+    as duas para números de 1 dígito seguidos de 'k' — "$3k" virava 3.000.000
+    em vez de 3.000. Foi esse erro que gerou o único "arb garantido" (falso) já
+    executado em produção ($50, 5% do capital): o strike de "$3k" virou
+    3.000.000 e passou a "dominar" logicamente qualquer outro strike real."""
+
+    @pytest.mark.parametrize("text,expected", [
+        ("$3k",      3_000.0),
+        ("$4k",      4_000.0),
+        ("$100k",    100_000.0),
+        ("$3.5k",    3_500.0),
+        ("$120K",    120_000.0),
+        ("$68,000",  68_000.0),
+        ("$2m",      2_000_000.0),
+    ])
+    def test_tabela_de_repro(self, text, expected):
+        assert deribit_collector._parse_strike(text) == expected
+
+    def test_sem_preco_retorna_none(self):
+        assert deribit_collector._parse_strike("Will it happen?") is None
+
+    def test_multiplos_precos_rejeita_em_vez_de_tirar_media(self):
+        """Antes: "between $60,000 and $70,000" virava a média (65.000) —
+        um strike fabricado que não corresponde a mercado nenhum. Agora
+        rejeita: sem um strike único e não-ambíguo, não há B-S para rodar."""
+        assert deribit_collector._parse_strike(
+            "Will BTC be between $60,000 and $70,000 on June 1?"
+        ) is None
+
+
+class TestParseCryptoMarketSpotDirection:
+    """P0-4 correlato: structural_arb.py usava parsed['direction'] sem a
+    correção de direção por spot que deribit_collector já aplicava no seu
+    próprio loop — dois consumidores, dois comportamentos. Agora a correção
+    mora dentro de parse_crypto_market(question, spot=...) e qualquer
+    consumidor com spot disponível herda o mesmo resultado."""
+
+    def test_sem_spot_usa_keyword(self):
+        # "hit" sozinho sugere upward — sem spot, fica nisso.
+        parsed = deribit_collector.parse_crypto_market(
+            "Will Bitcoin hit $50,000 by December 31, 2026?"
+        )
+        assert parsed["direction"] == "above"
+
+    def test_com_spot_acima_do_strike_corrige_para_dip(self):
+        # Spot em $100k: "hit $50k" só é possível se o preço CAIR — downward.
+        parsed = deribit_collector.parse_crypto_market(
+            "Will Bitcoin hit $50,000 by December 31, 2026?", spot=100_000.0,
+        )
+        assert parsed["direction"] == "below"
+
+    def test_com_spot_abaixo_do_strike_mantem_upward(self):
+        parsed = deribit_collector.parse_crypto_market(
+            "Will Bitcoin hit $150,000 by December 31, 2026?", spot=100_000.0,
+        )
+        assert parsed["direction"] == "above"
+
+    def test_mercado_europeu_ignora_spot(self):
+        # Não-touch: a direção vem da keyword da pergunta, não do spot —
+        # "above $68,000" já é explícito, não é uma barreira a tocar.
+        parsed = deribit_collector.parse_crypto_market(
+            "Will the price of Bitcoin be above $68,000 on April 2?", spot=10_000.0,
+        )
+        assert parsed["direction"] == "above"
+
+
+# ──────────────────────────────────────────────────────────
 # deribit_collector — bs_prob (P0-1: barreira saturava em 1.0 para todo touch upward)
 # ──────────────────────────────────────────────────────────
 
@@ -637,6 +708,17 @@ class TestMonotonicity:
     # endDate autoritativo da API — o parser de texto não decide expiração
     DEC = "2098-12-31T16:00:00Z"
     NOV = "2098-11-30T16:00:00Z"
+
+    @pytest.fixture(autouse=True)
+    def _fixed_spot(self, monkeypatch):
+        # P0-4 correlato: scan_monotonicity agora busca spot para corrigir a
+        # direção de mercados touch. Sem mock, isso bateria na Deribit de
+        # verdade a cada teste — quebra a garantia "sem rede" da suíte e torna
+        # o resultado dependente do preço real no momento do run. Spot fixo
+        # abaixo de todos os strikes usados aqui (BTC min=72k, ETH min=9k)
+        # preserva a semântica "above" que estes testes já assumiam.
+        spots = {"BTC": 50_000.0, "ETH": 3_000.0}
+        monkeypatch.setattr(structural_arb, "get_spot_price", lambda asset: spots.get(asset))
 
     def _universe(self, rows):
         base = {"liquidity": 10_000.0}

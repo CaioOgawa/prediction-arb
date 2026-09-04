@@ -50,7 +50,7 @@ from rich import box
 sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from deribit_collector import parse_crypto_market
+from deribit_collector import parse_crypto_market, get_spot_price
 from risk_manager import ARB_MIN_PROFIT
 
 GAMMA_BASE   = "https://gamma-api.polymarket.com"
@@ -256,12 +256,28 @@ def scan_monotonicity(df: pd.DataFrame, margin: float = MARGIN_MIN) -> list[dict
     _WINDOW_RE = re.compile(r"[A-Za-z]{3,9}\.?\s+\d{1,2}\s*[-–]\s*\d{1,2}\b")
     now = pd.Timestamp.now(tz="UTC")
 
+    # P0-4 correlato: mercados de touch precisam do spot ATUAL para saber se a
+    # barreira é upward ou downward (keyword sozinha erra "hit $50k" com spot
+    # em $100k, que é um dip). Cache por asset — no máximo 2 chamadas (BTC/ETH).
+    spot_cache: dict[str, float | None] = {}
+
+    def _spot_for(asset: str) -> float | None:
+        if asset not in spot_cache:
+            spot_cache[asset] = get_spot_price(asset)
+        return spot_cache[asset]
+
     recs = []
     for _, row in df.iterrows():
         q = str(row.get("question", ""))
         parsed = parse_crypto_market(q)
         if parsed is None or parsed.get("is_between"):
             continue
+        if parsed.get("is_touch"):
+            spot = _spot_for(parsed["asset"])
+            if spot is not None:
+                reparsed = parse_crypto_market(q, spot=spot)
+                if reparsed is not None:
+                    parsed = reparsed
         if _WINDOW_RE.search(q):
             continue  # janela ≠ barreira desde já — dominância não vale
         bid, ask = _f(row.get("bestBid")), _f(row.get("bestAsk"))
