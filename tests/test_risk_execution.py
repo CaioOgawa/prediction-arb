@@ -31,6 +31,7 @@ import ws_feed
 import gamma_collector
 import odds_collector
 import deribit_collector
+import market_pricing
 import risk_manager
 
 
@@ -762,6 +763,7 @@ class TestSimBacktestKellyParity:
 
 sys.path.insert(0, str(ROOT / "signals"))
 import structural_arb
+import signal_generator
 
 
 class TestNegRiskBasket:
@@ -1541,6 +1543,92 @@ class TestPaperTraderStopAntesDoRebalance:
         assert i_stop < i_rebalance
 
 
+class TestOpenPositionUsaEntryPriceReal:
+    """
+    P1-25 (achado na revisão): o gerador de sinal já calcula entry_price
+    executável (bestAsk/1-bestBid), mas open_position ignorava a coluna e
+    reconstruía yes_price(lastTradePrice) + spread/2 — o filtro dizia "cobre
+    custo a 0.53" e a posição era gravada a um preço diferente. Sem isso, o
+    P1-25 nunca chegava no cost_usdc/shares de verdade.
+    """
+
+    def _portfolio_and_signal(self, entry_price=None, spread=0.06, liquidity=0.0):
+        portfolio = {"current_cash": 1000.0}
+        signal = {
+            "condition_id": "0xnovo", "question": "Teste?", "underlying": "",
+            "direction": "BUY_YES", "yes_price": 0.50, "edge": 0.15, "prob_yes": 0.65,
+            "confidence": 1.0, "signal_source": "odds", "trade_type": "value",
+            "spread": spread, "liquidity": liquidity,
+        }
+        if entry_price is not None:
+            signal["entry_price"] = entry_price
+        return portfolio, signal
+
+    def test_com_entry_price_real_nao_reconstroi_de_yes_price(self, monkeypatch):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        monkeypatch.setattr(paper_trader, "load_current_markets", lambda: pd.DataFrame())
+        monkeypatch.setattr(paper_trader, "get_open_positions", lambda: pd.DataFrame())
+
+        portfolio, signal = self._portfolio_and_signal(entry_price=0.53)
+        pos = paper_trader.open_position(portfolio, signal, dry_run=True)
+
+        assert pos is not None
+        # yes_price(0.50) + spread/2(0.03) = 0.53 coincide por acidente aqui —
+        # o que importa é que NÃO veio de yes_price+spread/2 (sem meio-spread
+        # de novo): com liquidity=0 e real_entry_price setado, slippage=0.
+        assert pos["entry_price"] == pytest.approx(0.53)
+
+    def test_sem_entry_price_cai_pro_legado_yes_price_mais_meio_spread(self, monkeypatch):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        monkeypatch.setattr(paper_trader, "load_current_markets", lambda: pd.DataFrame())
+        monkeypatch.setattr(paper_trader, "get_open_positions", lambda: pd.DataFrame())
+
+        portfolio, signal = self._portfolio_and_signal(entry_price=None, spread=0.06)
+        pos = paper_trader.open_position(portfolio, signal, dry_run=True)
+
+        assert pos is not None
+        # Legado: yes_price(0.50) + spread/2(0.03) = 0.53 — mesmo valor do
+        # teste acima, mas chegando pelo caminho antigo (sem coluna entry_price).
+        assert pos["entry_price"] == pytest.approx(0.53)
+
+    def test_nao_desconta_spread_duas_vezes_com_entry_price_real(self, monkeypatch):
+        # Regressão específica: liquidity > 0 soma impacto de mercado. Com
+        # real_entry_price, NÃO deve somar effective_spread/2 de novo por cima.
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        monkeypatch.setattr(paper_trader, "load_current_markets", lambda: pd.DataFrame())
+        monkeypatch.setattr(paper_trader, "get_open_positions", lambda: pd.DataFrame())
+
+        portfolio, signal = self._portfolio_and_signal(entry_price=0.53, spread=0.06, liquidity=1_000_000.0)
+        pos = paper_trader.open_position(portfolio, signal, dry_run=True)
+
+        assert pos is not None
+        # liquidity gigante → impact ≈ 0 → slippage ≈ 0 → entry_price ≈ real_entry_price.
+        # Se o spread/2 (0.03) tivesse sido somado de novo, daria ~0.56.
+        assert pos["entry_price"] == pytest.approx(0.53, abs=0.01)
+
+    def test_re_cotacao_prefere_book_fresco_sobre_entry_price_do_sinal(self, monkeypatch):
+        # current_mkts tem um bestAsk mais barato que o gravado no sinal (book
+        # melhorou) — a versão fresca deve vencer, não o valor stale do sinal.
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        fresh_mkts = pd.DataFrame([{
+            "conditionId": "0xnovo", "yes_price": 0.50, "spread": 0.02,
+            "bestBid": 0.485, "bestAsk": 0.495,
+        }])
+        monkeypatch.setattr(paper_trader, "load_current_markets", lambda: fresh_mkts)
+        monkeypatch.setattr(paper_trader, "get_open_positions", lambda: pd.DataFrame())
+
+        # entry_price "stale" do sinal é bem pior (0.60) que o book fresco (0.495).
+        portfolio, signal = self._portfolio_and_signal(entry_price=0.60, spread=0.06)
+        pos = paper_trader.open_position(portfolio, signal, dry_run=True)
+
+        assert pos is not None
+        assert pos["entry_price"] < 0.55  # veio do book fresco, não do 0.60 stale
+
+
 class TestArbAlert:
     OPP = {
         "kind": "monotonicity", "guaranteed": True, "arb_group": "mono:0xa>0xb",
@@ -1581,3 +1669,318 @@ class TestArbAlert:
         # Próximo ciclo (envio volta a funcionar) deve re-tentar
         monkeypatch.setattr(notify, "_send", lambda text: sent.append(text) or True)
         assert notify.arb_alert([self.OPP]) is True
+
+
+# ──────────────────────────────────────────────────────────
+# market_pricing — preço executável e net edge (P1-25/P1-26)
+# ──────────────────────────────────────────────────────────
+
+class TestEntryPriceNetEdge:
+    """
+    P1-25: yes_price na camada de sinal é lastTradePrice — uma impressão, não
+    um preço executável. entry_price_and_net_edge usa bestBid/bestAsk de
+    verdade (já coletados, nunca usados pra isso) e desconta o custo real.
+    """
+
+    def test_buy_yes_usa_best_ask(self):
+        mkt = {"bestBid": 0.40, "bestAsk": 0.45, "spread": 0.05}
+        result = market_pricing.entry_price_and_net_edge(
+            mkt, "BUY_YES", fair_yes=0.55, fair_no=0.45, source="odds",
+        )
+        assert result is not None
+        entry_price, spread, net_edge = result
+        assert entry_price == 0.45
+        assert spread == pytest.approx(0.05)
+        assert net_edge == pytest.approx(0.55 - 0.45)  # fee=0 hoje
+
+    def test_buy_no_usa_um_menos_best_bid(self):
+        mkt = {"bestBid": 0.40, "bestAsk": 0.45, "spread": 0.05}
+        result = market_pricing.entry_price_and_net_edge(
+            mkt, "BUY_NO", fair_yes=0.30, fair_no=0.70, source="odds",
+        )
+        assert result is not None
+        entry_price, spread, net_edge = result
+        assert entry_price == pytest.approx(0.60)
+        assert net_edge == pytest.approx(0.70 - 0.60)
+
+    def test_sem_ask_pra_buy_yes_retorna_none(self):
+        mkt = {"bestBid": 0.40, "bestAsk": None, "spread": 0.05}
+        assert market_pricing.entry_price_and_net_edge(mkt, "BUY_YES", 0.55, 0.45, source="odds") is None
+
+    def test_sem_bid_pra_buy_no_retorna_none(self):
+        mkt = {"bestBid": None, "bestAsk": 0.45, "spread": 0.05}
+        assert market_pricing.entry_price_and_net_edge(mkt, "BUY_NO", 0.30, 0.70, source="odds") is None
+
+    def test_spread_largo_demais_descarta_o_candidato(self):
+        # MIN_EDGE_TO_TRADE["odds"]=0.08 × MAX_SPREAD_TO_MIN_EDGE_RATIO=1.0 → veto acima de 0.08
+        mkt = {"bestBid": 0.30, "bestAsk": 0.45, "spread": 0.15}  # spread real = 0.15
+        assert market_pricing.entry_price_and_net_edge(mkt, "BUY_YES", 0.55, 0.45, source="odds") is None
+
+    def test_spread_dentro_do_limite_passa(self):
+        mkt = {"bestBid": 0.42, "bestAsk": 0.45, "spread": 0.03}
+        result = market_pricing.entry_price_and_net_edge(mkt, "BUY_YES", 0.55, 0.45, source="odds")
+        assert result is not None
+
+    def test_spread_do_veto_vem_da_coluna_quando_bid_falta(self):
+        # Sem bestBid não dá pra calcular ask-bid — cai pro campo spread bruto.
+        mkt = {"bestBid": None, "bestAsk": 0.10, "spread": 0.02}
+        result = market_pricing.entry_price_and_net_edge(mkt, "BUY_YES", 0.15, 0.85, source="odds")
+        assert result is not None
+        _, spread, _ = result
+        assert spread == pytest.approx(0.02)
+
+    def test_piso_de_spread_e_por_fonte(self):
+        # deribit tem MIN_EDGE_TO_TRADE menor (0.05) — mesmo spread que passaria
+        # em odds (0.08) é vetado em deribit.
+        mkt = {"bestBid": 0.40, "bestAsk": 0.47, "spread": 0.07}
+        assert market_pricing.entry_price_and_net_edge(mkt, "BUY_YES", 0.55, 0.45, source="odds") is not None
+        assert market_pricing.entry_price_and_net_edge(mkt, "BUY_YES", 0.55, 0.45, source="deribit") is None
+
+
+class TestApplyEdgeShrinkage:
+    """P1-26: maldição do vencedor — ordenar por net_edge bruto entre milhares
+    de estimativas ruidosas seleciona o topo da distribuição de erro, não de
+    mispricing real. Encolhe proporcionalmente ao consensus_spread."""
+
+    def test_sem_net_edge_faz_passthrough_do_abs_divergence(self):
+        df = pd.DataFrame([{"abs_divergence": 0.12}, {"abs_divergence": 0.08}])
+        out = market_pricing.apply_edge_shrinkage(df)
+        assert list(out["shrunk_edge"]) == [0.12, 0.08]
+
+    def test_variancia_degenerada_nao_encolhe(self):
+        # net_edge idênticos → var_edge=0 → sem correção possível, passa direto.
+        df = pd.DataFrame([
+            {"net_edge": 0.10, "consensus_spread": 0.01},
+            {"net_edge": 0.10, "consensus_spread": 0.05},
+        ])
+        out = market_pricing.apply_edge_shrinkage(df)
+        assert list(out["shrunk_edge"]) == [0.10, 0.10]
+
+    def test_consensus_spread_alto_encolhe_mais_que_baixo(self):
+        # Terceira linha só pra dar variância não-degenerada ao lote (sem ela
+        # var_edge=0 e nada encolhe, ver test_variancia_degenerada_nao_encolhe).
+        df = pd.DataFrame([
+            {"net_edge": 0.20, "consensus_spread": 0.001},  # books concordam — quase intacto
+            {"net_edge": 0.20, "consensus_spread": 0.30},   # books discordam — puxado a zero
+            {"net_edge": 0.05, "consensus_spread": 0.05},
+        ])
+        out = market_pricing.apply_edge_shrinkage(df)
+        low_spread_shrunk, high_spread_shrunk = out["shrunk_edge"].iloc[0], out["shrunk_edge"].iloc[1]
+        assert low_spread_shrunk > high_spread_shrunk
+        assert low_spread_shrunk == pytest.approx(0.20, abs=0.02)
+        assert high_spread_shrunk < 0.20 * 0.5
+
+    def test_math_bate_com_a_formula_manual(self):
+        rows = [
+            {"net_edge": 0.10, "consensus_spread": 0.02},
+            {"net_edge": 0.15, "consensus_spread": 0.05},
+            {"net_edge": 0.05, "consensus_spread": 0.10},
+        ]
+        df = pd.DataFrame(rows)
+        var_edge = df["net_edge"].var()
+        expected = [
+            round(r["net_edge"] * var_edge / (var_edge + r["consensus_spread"] ** 2), 4)
+            for r in rows
+        ]
+        out = market_pricing.apply_edge_shrinkage(df)
+        assert list(out["shrunk_edge"]) == expected
+
+
+# ──────────────────────────────────────────────────────────
+# odds_collector — matching com entry_price/net_edge (P1-25)
+# ──────────────────────────────────────────────────────────
+
+def _fake_h2h_event(home_team, away_team, home_odds, away_odds, sport_key="basketball_nba",
+                     hours_from_now=24, bookmaker="pinnacle"):
+    commence = datetime.now(timezone.utc) + pd.Timedelta(hours=hours_from_now)
+    return {
+        "sport_key": sport_key,
+        "home_team": home_team,
+        "away_team": away_team,
+        "commence_time": commence.isoformat(),
+        "bookmakers": [{
+            "key": bookmaker,
+            "markets": [{
+                "key": "h2h",
+                "outcomes": [
+                    {"name": home_team, "price": home_odds},
+                    {"name": away_team, "price": away_odds},
+                ],
+            }],
+        }],
+    }
+
+
+def _fake_market_row(condition_id, question, yes_price, best_bid, best_ask, spread,
+                      hours_from_now=24, liquidity=10_000.0):
+    end_date = datetime.now(timezone.utc) + pd.Timedelta(hours=hours_from_now)
+    return {
+        "conditionId": condition_id,
+        "question":    question,
+        "category":    "sports",
+        "yes_price":   yes_price,
+        "bestBid":     best_bid,
+        "bestAsk":     best_ask,
+        "spread":      spread,
+        "endDate":     end_date.isoformat(),
+        "liquidity":   liquidity,
+        "volume24hr":  50_000.0,
+    }
+
+
+class TestMatchMarketsToOddsEntryPrice:
+    def _match(self, mkt_row, event):
+        markets_df = pd.DataFrame([mkt_row])
+        return odds_collector.match_markets_to_odds(markets_df, [event], min_score=0.25)
+
+    def test_linha_matched_carrega_entry_price_e_net_edge(self):
+        # Fair (sem vig) pra odds [1.60, 2.50] favorece o home moderadamente.
+        # yes_price=0.50 empurra a divergência mid-based pra BUY_NO ou BUY_YES
+        # dependendo do fair — o teste só precisa que as colunas apareçam e
+        # sejam consistentes com bestBid/bestAsk, não de um valor fixo de fair.
+        event = _fake_h2h_event("Los Angeles Lakers", "Boston Celtics", 1.60, 2.50)
+        mkt = _fake_market_row(
+            "0xabc", "Los Angeles Lakers vs. Boston Celtics",
+            yes_price=0.50, best_bid=0.48, best_ask=0.52, spread=0.04,
+        )
+        df = self._match(mkt, event)
+        assert not df.empty
+        row = df.iloc[0]
+        assert {"entry_price", "spread", "net_edge"}.issubset(df.columns)
+        if row["direction"] == "BUY_YES":
+            assert row["entry_price"] == pytest.approx(0.52)
+        else:
+            assert row["entry_price"] == pytest.approx(1.0 - 0.48)
+
+    def test_sem_book_do_lado_necessario_descarta_a_linha(self):
+        # fair_home ≈ 0.60 (odds 1.65/2.50, overround baixo — passa o gate de
+        # plausibilidade); yes_price=0.40 dá divergência -0.20 → direção
+        # BUY_YES. Sem bestAsk, a linha não pode ser precificada de verdade.
+        event = _fake_h2h_event("Los Angeles Lakers", "Boston Celtics", 1.65, 2.50)
+        mkt = _fake_market_row(
+            "0xabc", "Los Angeles Lakers vs. Boston Celtics",
+            yes_price=0.40, best_bid=0.38, best_ask=None, spread=0.05,
+        )
+        df = self._match(mkt, event)
+        assert df.empty
+
+    def test_spread_largo_demais_descarta_a_linha(self):
+        event = _fake_h2h_event("Los Angeles Lakers", "Boston Celtics", 1.60, 2.50)
+        mkt = _fake_market_row(
+            "0xabc", "Los Angeles Lakers vs. Boston Celtics",
+            yes_price=0.50, best_bid=0.30, best_ask=0.70, spread=0.40,  # spread=0.40 >> 0.08
+        )
+        df = self._match(mkt, event)
+        assert df.empty
+
+    def test_net_edge_menor_que_divergence_mid_quando_ha_spread(self):
+        # O ponto inteiro do P1-25: o edge de verdade é MENOR que a divergência
+        # calculada contra o mid/last, porque paga o spread. fair_home≈0.60
+        # (odds 1.65/2.50); yes_price=0.50 → divergência mid = -0.10,
+        # direção BUY_YES; net_edge = fair - bestAsk(0.53) = 0.60-0.53≈0.07.
+        # spread=0.06 fica sob o piso de veto (0.08) — precisa passar, não só existir.
+        event = _fake_h2h_event("Los Angeles Lakers", "Boston Celtics", 1.65, 2.50)
+        mkt = _fake_market_row(
+            "0xabc", "Los Angeles Lakers vs. Boston Celtics",
+            yes_price=0.50, best_bid=0.47, best_ask=0.53, spread=0.06,
+        )
+        df = self._match(mkt, event)
+        assert not df.empty
+        row = df.iloc[0]
+        assert abs(row["net_edge"]) < row["abs_divergence"]
+
+
+class TestMatchOutrightEntryPrice:
+    def test_outright_carrega_entry_price_e_net_edge(self):
+        event = {
+            "sport_key": "basketball_nba_championship_winner",
+            "sport_title": "NBA Championship Winner",
+            "bookmakers": [{
+                "key": "pinnacle",
+                "markets": [{
+                    "key": "outrights",
+                    "outcomes": [
+                        {"name": "Boston Celtics", "price": 3.5},
+                        {"name": "Los Angeles Lakers", "price": 8.0},
+                        {"name": "Denver Nuggets", "price": 12.0},
+                    ],
+                }],
+            }],
+        }
+        mkt = pd.DataFrame([{
+            "conditionId": "0xout1",
+            "question":    "Will the Boston Celtics win the championship?",
+            "category":    "sports",
+            "yes_price":   0.25,
+            "bestBid":     0.22,
+            "bestAsk":     0.28,
+            "spread":      0.06,
+            "endDate":     (datetime.now(timezone.utc) + pd.Timedelta(days=60)).isoformat(),
+            "liquidity":   20_000.0,
+            "volume24hr":  100_000.0,
+        }])
+        df = odds_collector.match_outright_markets(mkt, [event], min_score=0.35)
+        assert not df.empty
+        row = df.iloc[0]
+        assert {"entry_price", "spread", "net_edge"}.issubset(df.columns)
+
+
+# ──────────────────────────────────────────────────────────
+# signal_generator — edge de verdade chega no Kelly (P1-25/P1-26)
+# ──────────────────────────────────────────────────────────
+
+class TestSignalGeneratorUsaEdgeDeVerdade:
+    """
+    O fix do P1-25/P1-26 só importa se o `edge` que o Kelly usa pra dimensionar
+    a posição vier do net_edge/shrunk_edge — não da divergência bruta contra
+    yes_price (lastTradePrice). Testa a costura final: parquet do collector →
+    campo "edge" consumido por risk_manager.kelly_size.
+    """
+
+    def _odds_row(self, **overrides):
+        now = datetime.now(timezone.utc)
+        row = {
+            "condition_id": "0xabc", "question": "Lakers vs Celtics", "category": "sports",
+            "underlying": "basketball_nba:x", "yes_price": 0.50, "entry_price": 0.55,
+            "spread": 0.10, "fair_prob_yes": 0.65, "fair_prob_no": 0.35,
+            "divergence": -0.15, "abs_divergence": 0.15, "net_edge": 0.10,
+            "shrunk_edge": 0.07,  # encolhido — menor que net_edge bruto
+            "direction": "BUY_YES", "yes_team": "Lakers", "home_team": "Lakers",
+            "away_team": "Celtics", "bookmaker": "pinnacle", "overround": 1.02,
+            "is_sharp": True, "n_books": 3, "consensus_spread": 0.02,
+            "vig_method": "multiplicative", "match_score": 0.9, "sport_key": "basketball_nba",
+            "commence_time": (now + pd.Timedelta(hours=24)).isoformat(),
+            "end_date": (now + pd.Timedelta(hours=26)).isoformat(),
+            "liquidity": 10_000.0, "volume_24h": 50_000.0, "market_type": "h2h",
+        }
+        row.update(overrides)
+        return row
+
+    def test_edge_final_e_o_shrunk_edge_nao_o_mid_bruto(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(signal_generator, "RAW_ODDS_DIR", tmp_path)
+        pd.DataFrame([self._odds_row()]).to_parquet(tmp_path / "odds_matched_20260101_000000.parquet")
+
+        signals = signal_generator.generate_odds_signals(
+            min_divergence=0.03, min_liquidity=1_000, min_volume24h=0,
+            min_days_left=0, min_match_score=0.25, save=False,
+        )
+        assert not signals.empty
+        row = signals.iloc[0]
+        assert row["edge"] == pytest.approx(0.07)          # shrunk_edge, não 0.15 (mid) nem 0.10 (net cru)
+        assert row["abs_edge"] == pytest.approx(0.07)
+
+    def test_compat_parquet_antigo_sem_net_edge_cai_pro_calculo_legado(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(signal_generator, "RAW_ODDS_DIR", tmp_path)
+        legacy_row = self._odds_row()
+        del legacy_row["net_edge"]
+        del legacy_row["shrunk_edge"]
+        pd.DataFrame([legacy_row]).to_parquet(tmp_path / "odds_matched_20260101_000000.parquet")
+
+        signals = signal_generator.generate_odds_signals(
+            min_divergence=0.03, min_liquidity=1_000, min_volume24h=0,
+            min_days_left=0, min_match_score=0.25, save=False,
+        )
+        assert not signals.empty
+        row = signals.iloc[0]
+        # legado: prob_yes - yes_price = 0.65 - 0.50 = 0.15
+        assert row["edge"] == pytest.approx(0.15)

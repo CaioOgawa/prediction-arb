@@ -45,6 +45,20 @@ KELLY_FULL_CAP    = 0.10
 # do paper_trader). O gate fino por fonte é MIN_EDGE_TO_TRADE, aplicado no kelly_size.
 MIN_EDGE_ABS      = 0.03
 
+# P1-25: custo de transação. `yes_price` na camada de sinal vem de
+# lastTradePrice (odds_collector.py/deribit_collector.py) — uma impressão, não
+# um preço executável. O meio-spread sozinho é rotineiramente 1-3pp nesses
+# books, o que por si só já come boa parte de um threshold de 0.03-0.08.
+# Polymarket CLOB não cobra fee de maker/taker hoje — fica em 0.0, mas nomeado
+# pra não desaparecer num literal se isso mudar (gas via relayer entraria aqui).
+TRANSACTION_FEE_PCT = 0.0
+
+# Spread (bestAsk - bestBid) acima disso, relativo ao piso de edge da própria
+# fonte, já consome o edge mínimo sozinho — o "sinal" é custo de execução, não
+# alpha. Usado por odds_collector/deribit_collector pra descartar o candidato
+# antes mesmo de calcular net_edge.
+MAX_SPREAD_TO_MIN_EDGE_RATIO = 1.0
+
 # Tamanho por tipo de trade
 # Momentum: posições menores, rotação rápida (saída antes da resolução)
 # Value: posições maiores, hold até resolução (edge fundamental)

@@ -34,6 +34,8 @@ from rich.table import Table
 from rich import box
 from scipy.stats import norm
 
+from market_pricing import entry_price_and_net_edge
+
 RAW_MKT_DIR   = Path("data/raw/markets")
 RAW_ODDS_DIR  = Path("data/raw/odds")
 RAW_ODDS_DIR.mkdir(parents=True, exist_ok=True)
@@ -698,6 +700,18 @@ def run(
                 f"({asset} K=${strike:,.0f})"
             )
             continue
+
+        trade_signal = "BUY_NO" if divergence > 0 else "BUY_YES"
+
+        # P1-25: entry_price executável (bestAsk/1-bestBid), não yes_price
+        # (lastTradePrice). net_edge já desconta spread real e fees.
+        priced = entry_price_and_net_edge(
+            market_row, trade_signal, fair_prob, 1.0 - fair_prob, source="deribit",
+        )
+        if priced is None:
+            continue  # sem book confiável nesse lado, ou spread come o edge mínimo
+        entry_price, book_spread, net_edge = priced
+
         end_dt     = pd.to_datetime(market_row.get("endDate"), errors="coerce", utc=True)
         hrs_left   = ((end_dt - pd.Timestamp(now)) / pd.Timedelta(hours=1)) if pd.notna(end_dt) else -1
 
@@ -710,10 +724,13 @@ def run(
             "strike":         strike,
             "direction":      direction,
             "yes_price":      round(yes_price, 4),
+            "entry_price":    round(entry_price, 4),
+            "spread":         round(book_spread, 4),
             "fair_prob":      round(fair_prob, 4),
-            "divergence":     divergence,
+            "divergence":     divergence,           # legado, mid-based — só p/ display
             "abs_divergence": abs(divergence),
-            "signal":         "BUY_NO" if divergence > 0 else "BUY_YES",
+            "net_edge":       net_edge,             # edge de verdade: fair - entry_price - fee
+            "signal":         trade_signal,
             "is_touch":       is_touch,
             "spot_price":     round(spot, 2),
             "iv":             round(iv, 4),
@@ -737,12 +754,15 @@ def run(
 
     df = (
         pd.DataFrame(rows)
-        .sort_values("abs_divergence", ascending=False)
+        .sort_values("net_edge", ascending=False)
         .reset_index(drop=True)
     )
 
-    result = df[df["abs_divergence"] >= min_divergence].reset_index(drop=True)
-    logger.info(f"Sinais calculados: {len(df):,} | Com divergência >= {min_divergence}: {len(result):,}")
+    # P1-25: net_edge já é líquido de spread/fees — ordenar/filtrar por ele
+    # em vez de abs_divergence (mid-based, ignora se o book dá pra executar).
+    # Sem consensus_spread equivalente aqui, sem shrinkage (P1-26) — só odds tem.
+    result = df[df["net_edge"] >= min_divergence].reset_index(drop=True)
+    logger.info(f"Sinais calculados: {len(df):,} | Com net_edge >= {min_divergence}: {len(result):,}")
 
     if save and not result.empty:
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")

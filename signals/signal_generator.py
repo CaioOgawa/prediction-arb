@@ -435,29 +435,40 @@ def generate_odds_signals(
     # min_days_left=1 → pelo menos 24h → só jogos de amanhã em diante
     # min_days_left=0 → aceita jogos de hoje (recomendado para intraday)
     min_hours = min_days_left * 24
+    # P1-25/P1-26: filtra pelo edge de verdade (net_edge encolhido — líquido de
+    # spread/fees, corrigido pra maldição do vencedor), não abs_divergence
+    # (mid-based, ignora se dá pra executar). Fallback pra parquet antigo do
+    # collector, gerado antes desse fix.
+    edge_col = "shrunk_edge" if "shrunk_edge" in odds_df.columns else "abs_divergence"
     mask = (
-        (odds_df["abs_divergence"]  >= min_divergence) &
+        (odds_df[edge_col]          >= min_divergence) &
         (odds_df["liquidity"]       >= min_liquidity)  &
         (odds_df.get("volume_24h", pd.Series(9999, index=odds_df.index)) >= min_volume24h) &
         (odds_df["hours_to_start"]  >= min_hours)      &
         (odds_df["match_score"]     >= min_match_score)
     )
 
-    signals = odds_df[mask].sort_values("abs_divergence", ascending=False).reset_index(drop=True)
+    signals = odds_df[mask].sort_values(edge_col, ascending=False).reset_index(drop=True)
 
     if signals.empty:
         return pd.DataFrame()
 
     # Renomeia para interface uniforme
     if "fair_prob_yes" in signals.columns:
-        signals = signals.rename(columns={
-            "fair_prob_yes": "prob_yes",
-            "abs_divergence": "abs_edge",
-        })
-    # CONVENÇÃO ÚNICA (2026-07): edge = prob_yes − yes_price.
-    # Positivo → mercado subprecifica YES → BUY_YES. O parquet do collector guarda
-    # "divergence" com o sinal oposto (yes − fair, legado) — por isso recalculamos aqui.
-    signals["edge"] = (signals["prob_yes"] - signals["yes_price"]).round(4)
+        signals = signals.rename(columns={"fair_prob_yes": "prob_yes"})
+    # CONVENÇÃO ÚNICA (2026-07), revisada no P1-25/P1-26: edge = net_edge
+    # encolhido (fair_prob − entry_price_executável − fee, corrigido pra
+    # maldição do vencedor) — não mais prob_yes − yes_price. yes_price é
+    # lastTradePrice (impressão, não preço que dá pra pegar); Kelly sizing
+    # herda esse edge direto, então usar o bruto/mid inflava a posição.
+    if "shrunk_edge" in signals.columns:
+        signals["edge"] = signals["shrunk_edge"]
+    elif "net_edge" in signals.columns:
+        signals["edge"] = signals["net_edge"]
+    else:
+        # Compat: parquet de antes do P1-25, sem net_edge — cai pro cálculo legado.
+        signals["edge"] = (signals["prob_yes"] - signals["yes_price"]).round(4)
+    signals["abs_edge"] = signals["edge"].abs().round(4)
     signals["signal_source"] = "odds"
 
     # Classifica trade_type:
@@ -620,8 +631,11 @@ def generate_deribit_signals(
             if age_min > 60:
                 logger.warning("Cache deribit com mais de 60min — considere --fetch-fresh")
             df = pd.read_parquet(cached[-1])
-            if "abs_divergence" in df.columns:
-                df = df[df["abs_divergence"] >= min_divergence].reset_index(drop=True)
+            # P1-25: net_edge já é líquido de spread/fees — filtra por ele em
+            # vez de abs_divergence (mid-based). Fallback pra parquet antigo.
+            edge_col = "net_edge" if "net_edge" in df.columns else "abs_divergence"
+            if edge_col in df.columns:
+                df = df[df[edge_col] >= min_divergence].reset_index(drop=True)
 
     if df.empty:
         _print_deribit_signals_table(pd.DataFrame(), top_n=top_n)
@@ -634,11 +648,17 @@ def generate_deribit_signals(
         "direction":      "market_direction",   # "above" ou "below"
         "signal":         "direction",          # "BUY_YES" ou "BUY_NO"
         "fair_prob":      "prob_yes",
-        "abs_divergence": "abs_edge",
     })
-    # CONVENÇÃO ÚNICA (2026-07): edge = prob_yes − yes_price (positivo → BUY_YES).
-    # A coluna "divergence" do collector tem o sinal oposto (legado).
-    df["edge"] = (df["prob_yes"] - df["yes_price"]).round(4)
+    # CONVENÇÃO ÚNICA (2026-07), revisada no P1-25: edge = net_edge (fair_prob
+    # − entry_price_executável − fee), não mais prob_yes − yes_price. yes_price
+    # é lastTradePrice (impressão, não preço que dá pra pegar) — Kelly sizing
+    # herda esse edge direto, então usar o mid inflava a posição.
+    if "net_edge" in df.columns:
+        df["edge"] = df["net_edge"]
+    else:
+        # Compat: parquet de antes do P1-25, sem net_edge — cai pro cálculo legado.
+        df["edge"] = (df["prob_yes"] - df["yes_price"]).round(4)
+    df["abs_edge"] = df["edge"].abs().round(4)
     df["signal_source"] = "deribit"
 
     # Score de confiança: tempo curto (γ alto) + IV alta (B-S incerto) reduzem confiança

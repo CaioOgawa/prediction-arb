@@ -262,6 +262,8 @@ def open_position(
     """
     sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
     from risk_manager import kelly_size, check_exposure, MIN_EDGE_ABS
+    sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
+    from market_pricing import entry_price_and_net_edge
 
     direction    = str(signal.get("direction", ""))
     yes_price    = float(signal.get("yes_price", 0.5))
@@ -275,6 +277,13 @@ def open_position(
 
     if direction not in ("BUY_YES", "BUY_NO"):
         return None
+
+    # P1-25: preço executável real (bestAsk/1-bestBid) calculado pelo gerador
+    # de sinal — não a reconstrução yes_price(lastTradePrice) + spread/2.
+    # Pode ficar stale até 60min (idade do sinal); re-cotação abaixo tenta
+    # uma versão mais fresca antes de cair pro valor do sinal.
+    real_entry_price = signal.get("entry_price")
+    real_entry_price = float(real_entry_price) if pd.notna(real_entry_price) else None
 
     # ── Re-cotação: verifica preço atual antes de abrir ──────────────────
     # O sinal pode ter sido gerado há até 60min; re-cotamos para garantir
@@ -308,9 +317,22 @@ def open_position(
             spread    = fresh_spread
             edge      = refreshed_edge
 
+            # Preço executável fresco do snapshot atual, se o book der pra usar
+            # (mesmo cálculo bestAsk/1-bestBid do gerador de sinal) — mais
+            # recente que o entry_price gravado no sinal, então tem prioridade.
+            # fair_prob acima já é fair_yes nas duas direções (yes_price±edge
+            # reconstrói o mesmo fair_yes, só o sinal do edge muda com a direção).
+            fresh_priced = entry_price_and_net_edge(
+                row, direction, fair_prob, 1.0 - fair_prob, source=signal_source,
+            )
+            if fresh_priced is not None:
+                real_entry_price = fresh_priced[0]
+
     # Preço de entrada base (sem market impact por enquanto — recalculado após Kelly)
     liquidity = float(signal.get("liquidity") or 0)
-    if direction == "BUY_YES":
+    if real_entry_price is not None:
+        entry_price = min(real_entry_price, 0.98)
+    elif direction == "BUY_YES":
         entry_price = min(yes_price + spread / 2, 0.98)
     else:
         entry_price = min((1.0 - yes_price) + spread / 2, 0.98)
@@ -349,14 +371,20 @@ def open_position(
         n_correlated=n_correlated,
     )
 
-    # Recalcula entry_price com market impact agora que size_usdc é conhecido
+    # Recalcula entry_price com market impact agora que size_usdc é conhecido.
+    # Com real_entry_price, o meio-spread já está embutido no preço — somar
+    # spread/2 de novo seria o mesmo bug de desconto duplo já corrigido no
+    # ws_feed/early_exit_positions (P1-14); só o impacto de mercado do nosso
+    # próprio tamanho de ordem entra aqui.
     if liquidity > 0:
         impact = size_usdc / (liquidity * 0.10)
         effective_spread = spread * 2.0 if size_usdc > liquidity * 0.05 else spread
-        slippage = effective_spread / 2 + min(impact, spread)
+        slippage = min(impact, spread) if real_entry_price is not None else (effective_spread / 2 + min(impact, spread))
     else:
-        slippage = spread / 2
-    if direction == "BUY_YES":
+        slippage = 0.0 if real_entry_price is not None else spread / 2
+    if real_entry_price is not None:
+        entry_price = min(real_entry_price + slippage, 0.98)
+    elif direction == "BUY_YES":
         entry_price = min(yes_price + slippage, 0.98)
     else:
         entry_price = min((1.0 - yes_price) + slippage, 0.98)

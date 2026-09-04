@@ -20,9 +20,14 @@ Coloque ODDS_API_KEY no .env
 """
 
 import os
+import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+from market_pricing import (
+    entry_price_and_net_edge, apply_edge_shrinkage, log_rejected_implausible_edge,
+)
 
 try:
     from rapidfuzz import fuzz as _rfuzz
@@ -843,7 +848,17 @@ def match_markets_to_odds(
                 f"  Edge implausível {divergence:+.2%} descartado: '{question[:50]}' "
                 f"(yes={yes_price:.2f} fair={fair_yes:.2f})"
             )
+            log_rejected_implausible_edge(question, yes_price, fair_yes, divergence, source="odds")
             continue
+
+        direction = "BUY_NO" if divergence > 0 else "BUY_YES"
+
+        # P1-25: entry_price executável (bestAsk/1-bestBid), não yes_price
+        # (lastTradePrice). net_edge já desconta spread real e fees.
+        priced = entry_price_and_net_edge(mkt, direction, fair_yes, fair_no, source="odds")
+        if priced is None:
+            continue  # sem book confiável nesse lado, ou spread come o edge mínimo
+        entry_price, book_spread, net_edge = priced
 
         sport_key_val = best_match.get("sport_key", "")
         rows.append({
@@ -852,11 +867,14 @@ def match_markets_to_odds(
             "category":         mkt.get("category", ""),
             "underlying":       _underlying_key(sport_key_val, home_team, away_team),
             "yes_price":        round(yes_price, 4),
+            "entry_price":      round(entry_price, 4),
+            "spread":           round(book_spread, 4),
             "fair_prob_yes":    round(fair_yes, 4),
             "fair_prob_no":     round(fair_no, 4),
-            "divergence":       divergence,           # + → Poly overpriced YES, apostar NO
-            "abs_divergence":   abs(divergence),      # magnitude do edge
-            "direction":        "BUY_NO" if divergence > 0 else "BUY_YES",
+            "divergence":       divergence,           # + → Poly overpriced YES, apostar NO (legado, mid-based)
+            "abs_divergence":   abs(divergence),      # magnitude do edge legado — só p/ detector de bug
+            "net_edge":         net_edge,             # edge de verdade: fair - entry_price - fee
+            "direction":        direction,
             "yes_team":         yes_team,
             "home_team":        home_team,
             "away_team":          away_team,
@@ -880,7 +898,7 @@ def match_markets_to_odds(
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows).sort_values("abs_divergence", ascending=False).reset_index(drop=True)
+    df = pd.DataFrame(rows).sort_values("net_edge", ascending=False).reset_index(drop=True)
     return df
 
 
@@ -1059,6 +1077,15 @@ def match_outright_markets(
             continue
 
         divergence = round(yes_price - best_prob, 4)
+        direction  = "BUY_NO" if divergence > 0 else "BUY_YES"
+
+        # P1-25: mesmo tratamento de entry_price/net_edge do H2H.
+        priced = entry_price_and_net_edge(
+            mkt, direction, best_prob, 1.0 - best_prob, source="odds",
+        )
+        if priced is None:
+            continue
+        entry_price, book_spread, net_edge = priced
 
         rows.append({
             "condition_id":  mkt.get("conditionId"),
@@ -1066,11 +1093,14 @@ def match_outright_markets(
             "category":      mkt.get("category", ""),
             "underlying":    _underlying_key(best_ep["sport_key"], subject),
             "yes_price":     round(yes_price, 4),
+            "entry_price":   round(entry_price, 4),
+            "spread":        round(book_spread, 4),
             "fair_prob_yes": round(best_prob, 4),
             "fair_prob_no":  round(1.0 - best_prob, 4),
             "divergence":    divergence,
             "abs_divergence": abs(divergence),
-            "direction":     "BUY_NO" if divergence > 0 else "BUY_YES",
+            "net_edge":      net_edge,
+            "direction":     direction,
             "yes_team":      subject,
             "home_team":     best_team,   # outcome name no bookmaker
             "away_team":     "",
@@ -1093,7 +1123,7 @@ def match_outright_markets(
 
     return (
         pd.DataFrame(rows)
-        .sort_values("abs_divergence", ascending=False)
+        .sort_values("net_edge", ascending=False)
         .reset_index(drop=True)
     )
 
@@ -1270,18 +1300,15 @@ def run(
         logger.warning("Nenhum match encontrado (H2H nem outrights). Tente reduzir --min-match-score.")
         return pd.DataFrame()
 
-    matched = (
-        pd.concat(parts, ignore_index=True)
-        .sort_values("abs_divergence", ascending=False)
-        .reset_index(drop=True)
-    )
+    matched = pd.concat(parts, ignore_index=True)
+    matched = apply_edge_shrinkage(matched).sort_values("shrunk_edge", ascending=False).reset_index(drop=True)
 
-    result = matched[matched["abs_divergence"] >= min_divergence].reset_index(drop=True)
+    result = matched[matched["shrunk_edge"] >= min_divergence].reset_index(drop=True)
     n_h2h = (result.get("market_type", pd.Series()) == "h2h").sum()
     n_out = (result.get("market_type", pd.Series()) == "outright").sum()
     logger.info(
         f"Matched: {len(matched):,} total | "
-        f"Com edge >= {min_divergence}: {len(result):,} "
+        f"Com edge encolhido >= {min_divergence}: {len(result):,} "
         f"(H2H={n_h2h}, outrights={n_out})"
     )
 
