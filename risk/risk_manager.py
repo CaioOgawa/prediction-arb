@@ -388,8 +388,14 @@ def check_exposure(
             return False, f"limite de posições {trade_type} ({type_limit}) atingido"
 
     # 4. Limite por categoria
+    # "uncategorized" não é uma categoria real (Gamma API raramente preenche
+    # category/tag — ver gamma_collector.py), então não carrega sinal de
+    # correlação nenhum. Deixar esse bucket entrar no cap de 30% bloquearia
+    # trades não-correlacionados só porque nenhum dos dois lados tem
+    # category/tag de verdade. Quem protege correlação real é o cap de
+    # underlying (4b, 15%, mais apertado).
     category = str(signal.get("category", "")).lower()
-    if category and "category" in open_positions.columns:
+    if category and category != "uncategorized" and "category" in open_positions.columns:
         cat_cost = open_positions[
             open_positions["category"].str.lower() == category
         ]["cost_usdc"].sum()

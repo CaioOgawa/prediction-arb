@@ -188,6 +188,44 @@ class TestParsing:
         df = gamma_collector._parse_markets([mock_markets[2]])
         assert df.iloc[0]["category"] == "Crypto"
 
+    def test_parse_category_nunca_cai_pro_slug(self):
+        """
+        event_slug costuma ser a própria pergunta em kebab-case
+        ("will-bitcoin-reach-100k") — slug.split("-")[0] devolvia "will" como
+        categoria. Achado em produção: 6 de 23 posições abertas tinham
+        categoria "what", uma tinha "monotonicity" — sempre a primeira
+        palavra do slug, nunca uma categoria de verdade. Sem category/tag no
+        evento, o resultado tem que ser "uncategorized", não um chute do slug.
+        """
+        import gamma_collector
+        market = {
+            "conditionId": "0xslug",
+            "question": "Will Bitcoin reach $100k by December 31, 2026?",
+            "category": None,
+            "events": [{"slug": "will-bitcoin-reach-100k-by-december-31-2026"}],
+            "outcomePrices": ["0.5", "0.5"],
+            "clobTokenIds": ["t1", "t2"],
+            "volume": 1000.0,
+            "liquidity": 500.0,
+        }
+        df = gamma_collector._parse_markets([market])
+        assert df.iloc[0]["category"] == "uncategorized"
+
+    def test_parse_category_usa_tag_do_evento_quando_sem_category(self):
+        import gamma_collector
+        market = {
+            "conditionId": "0xtag",
+            "question": "Some question?",
+            "category": None,
+            "events": [{"slug": "some-slug", "tag": "Politics"}],
+            "outcomePrices": ["0.5", "0.5"],
+            "clobTokenIds": ["t1", "t2"],
+            "volume": 1000.0,
+            "liquidity": 500.0,
+        }
+        df = gamma_collector._parse_markets([market])
+        assert df.iloc[0]["category"] == "Politics"
+
     def test_parse_numeric_volumes(self, mock_markets):
         """volume, liquidity e volume24hr devem ser float."""
         import gamma_collector

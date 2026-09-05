@@ -101,12 +101,21 @@ def _parse_markets(raw: list[dict]) -> pd.DataFrame:
             else:
                 row["yes_price"] = None
 
-        # Categoria: campo direto ou herdado do evento pai
+        # Categoria: campo direto ou herdado do evento pai.
+        # NUNCA cair pro slug — event_slug costuma ser a própria pergunta
+        # ("will-bitcoin-reach-100k", "what-will-happen-in-brazil-election"),
+        # então slug.split("-")[0] devolve "will"/"what"/"who"/"which"/"next"
+        # como se fossem categoria. Isso é a categoria mais comum em produção
+        # hoje (achado ao investigar por que MAX_CATEGORY_PCT não bate com a
+        # exposição real do portfólio no dashboard: 6 das 23 posições abertas
+        # têm categoria "what", uma tem "monotonicity" — sempre primeira
+        # palavra do slug do evento, nunca uma categoria de verdade).
+        # "uncategorized" honesto é melhor que um valor plausível e errado.
         category = m.get("category")
         if not category:
             events = m.get("events", [])
             if events and isinstance(events, list):
-                category = events[0].get("category") or events[0].get("tag") or events[0].get("slug", "").split("-")[0]
+                category = events[0].get("category") or events[0].get("tag")
         row["category"] = category or "uncategorized"
 
         # Slug do evento pai (útil para agrupar mercados relacionados)

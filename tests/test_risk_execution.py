@@ -1826,6 +1826,47 @@ class TestUnderlyingExposure:
         assert not ok and "underlying" in reason
 
 
+class TestCategoryExposure:
+    """
+    Categoria "uncategorized" não é sinal de correlação nenhum (Gamma API
+    quase nunca preenche category/tag de verdade — ver gamma_collector.py e
+    o fix do fallback pro slug). Deixar esse bucket entrar no cap de 30%
+    bloquearia trades sem nenhuma relação entre si só por falta de dado.
+    """
+
+    def _open_uncategorized(self, n, cost_each=100.0):
+        return pd.DataFrame([
+            {"condition_id": f"0x{i}", "direction": "BUY_YES", "cost_usdc": cost_each,
+             "category": "uncategorized", "signal_source": "odds",
+             "trade_type": "value", "event_slug": f"ev-{i}"}
+            for i in range(n)
+        ])
+
+    def test_categoria_real_ainda_bloqueia_no_limite(self):
+        open_pos = pd.DataFrame([{
+            "condition_id": "0x1", "direction": "BUY_YES", "cost_usdc": 250.0,
+            "category": "politics", "signal_source": "odds",
+            "trade_type": "value", "event_slug": "ev-1",
+        }])
+        ok, reason = risk_manager.check_exposure(
+            {"condition_id": "0xnew", "signal_source": "odds", "trade_type": "value",
+             "category": "politics", "event_slug": "ev-novo"},
+            open_pos, {"initial_capital": 1000}, 100.0,
+        )
+        assert not ok and "categoria" in reason
+
+    def test_uncategorized_nao_bloqueia_mesmo_acima_do_cap(self):
+        # 3 posições de $100 já "uncategorized" = 30% de $1000 — categoria
+        # real bloquearia aqui, mas sem sinal de correlação isso não deveria.
+        open_pos = self._open_uncategorized(3)
+        ok, reason = risk_manager.check_exposure(
+            {"condition_id": "0xnew", "signal_source": "odds", "trade_type": "value",
+             "category": "uncategorized", "event_slug": "ev-novo"},
+            open_pos, {"initial_capital": 1000}, 100.0,
+        )
+        assert ok, reason
+
+
 class TestDirectionalSkew:
     """P1-11e: 20 das 21 posições do livro real eram BUY_YES."""
 
