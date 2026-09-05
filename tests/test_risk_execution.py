@@ -2504,6 +2504,16 @@ class TestRunExecutionGuardas:
         i_slots = self.SRC.index("slots = max(0, MAX_OPEN_POSITIONS - n_open)")
         assert i_needs_manual < i_slots
 
+    def test_abre_baskets_de_arb_estrutural(self):
+        # R2: antes só rodava em run_paper_trading (30min) — um basket que
+        # falhasse abrir não era retentado nos ticks de 5min intermediários.
+        # open_basket() já dedupe por condition_id operado, então reavaliar
+        # o mesmo CSV a cada 5min é seguro.
+        assert "open_arb_baskets" in self.SRC
+        i_baskets = self.SRC.index("open_arb_baskets(portfolio, current_mkts")
+        i_signals = self.SRC.index("load_signals(mode=mode)")
+        assert i_baskets < i_signals  # baskets antes das posições direcionais
+
 
 class TestPaperTraderStopAntesDoRebalance:
     """P1-12: mesmo bug de ordem existia em run_paper_trading — rebalance

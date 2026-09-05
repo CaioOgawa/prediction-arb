@@ -6,7 +6,9 @@ Responsabilidade separada do run_cycle.py (signal generation, 30min):
   1. Resolve posições fechadas / expiradas
   2. Verifica early exits (profit target, edge flip)
   3. Verifica stop loss por drawdown (bloqueia rebalance/abertura em halt)
-  4. Abre novas posições com sinais disponíveis (CSV mais recente)
+  3c. Abre baskets de arb estrutural pendentes (CSV mais recente, retry a
+      cada 5min de baskets que falharam abrir no ciclo anterior)
+  4. Abre novas posições direcionais com sinais disponíveis (CSV mais recente)
   5. Mark-to-market das posições abertas
 
 Por que separar?
@@ -81,6 +83,7 @@ def main(dry_run: bool, mode: str) -> None:
         load_current_markets,
         load_signals,
         mark_to_market,
+        open_arb_baskets,
         open_position,
         rebalance_positions,
         print_portfolio,
@@ -197,6 +200,25 @@ def main(dry_run: bool, mode: str) -> None:
             for r in rebalanced:
                 logger.info(f"  +${r['add_usdc']:.2f} {r['question'][:50]} edge={r['new_edge']:.1%}")
             portfolio = get_or_create_portfolio()
+
+    # ── 3c. Baskets de arb estrutural (execução atômica) ─────
+    # R2: só rodava em run_paper_trading (30min) — um basket que falhasse
+    # abrir (caixa insuficiente no momento, preço evaporou) não era
+    # reavaliado nos ticks de 5min intermediários, mesmo com o sinal ainda
+    # válido (MAX_ARB_SIGNAL_AGE_MINUTES=30). open_basket() já dedupe por
+    # condition_id já operado (get_traded_condition_ids), então reavaliar o
+    # mesmo CSV a cada 5min é seguro — um basket já aberto é ignorado nas
+    # próximas tentativas, só os que falharam são retentados.
+    baskets = open_arb_baskets(portfolio, current_mkts, dry_run=dry_run)
+    if baskets:
+        logger.info(f"Baskets estruturais abertos: {len(baskets)}")
+        for b in baskets:
+            logger.info(
+                f"  BASKET {b['arb_group']} | {b['n_legs']} pernas × {b['shares']:.1f} sh "
+                f"| custo ${b['total_cost']:.2f} → lucro garantido ${b['guaranteed_profit']:.2f}"
+            )
+        open_pos  = get_open_positions()
+        portfolio = get_or_create_portfolio()
 
     # ── 4. Abre novas posições ───────────────────────────────
     # Mesmos filtros de run_paper_trading (liquidez, budget de slots, cap de
