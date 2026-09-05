@@ -27,6 +27,8 @@ Uso manual:
   uv run python run_execution.py --dry-run
 """
 
+import atexit
+import fcntl
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +51,14 @@ logger.add(
 sys.path.insert(0, str(Path(__file__).parent / "execution"))
 sys.path.insert(0, str(Path(__file__).parent / "risk"))
 sys.path.insert(0, str(Path(__file__).parent))
+
+# R2: run_cycle.py já tinha esse lock (P1-20) — este daemon roda 6x mais
+# rápido (StartInterval de 5min) e não tinha proteção nenhuma contra
+# execuções sobrepostas. Uma chamada de rede pendurada (open_position,
+# load_current_markets) empilharia o próximo tick mutando as mesmas
+# posições ao mesmo tempo. LOCK_NB: se já tem outro rodando, pula este
+# ciclo em vez de esperar — o próximo tick de 5min já resolve.
+LOCK_PATH = Path("data/run_execution.lock")
 
 
 @click.command()
@@ -79,6 +89,16 @@ def main(dry_run: bool, mode: str) -> None:
         resolve_positions, early_exit_positions, reclassify_orphan_arb_legs,
         check_drawdown_stop, MAX_OPEN_POSITIONS, MIN_SIGNAL_LIQUIDITY, MAX_SIGNALS_PER_CYCLE,
     )
+
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.warning(f"Outro run_execution.py já em execução (lock {LOCK_PATH}) — ciclo pulado")
+        lock_fh.close()
+        return
+    atexit.register(lambda: (fcntl.flock(lock_fh, fcntl.LOCK_UN), lock_fh.close()))
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     logger.info(f"=== Execution daemon iniciado: {now} ===")
@@ -190,9 +210,18 @@ def main(dry_run: bool, mode: str) -> None:
         ]
     signals_top = signals.head(MAX_SIGNALS_PER_CYCLE)
 
-    n_open = len(open_pos) if not open_pos.empty else 0
-    if not open_pos.empty and "trade_type" in open_pos.columns:
-        n_open = int((open_pos["trade_type"].fillna("value") != "arb").sum())
+    # Pernas de arb não ocupam slots direcionais (mesma regra do check_exposure);
+    # nem posições travadas esperando revisão manual (P1-16) — mercado já
+    # fechou. Mesmo filtro de paper_trader.run_paper_trading — antes deste
+    # fix, uma posição travada inflava n_open aqui e podia fazer este loop
+    # parar de escanear sinais mais cedo do que deveria.
+    open_pos_for_slots = open_pos
+    if not open_pos.empty and "needs_manual_resolution" in open_pos.columns:
+        open_pos_for_slots = open_pos[open_pos["needs_manual_resolution"].fillna(0) != 1]
+    if not open_pos_for_slots.empty and "trade_type" in open_pos_for_slots.columns:
+        n_open = int((open_pos_for_slots["trade_type"].fillna("value") != "arb").sum())
+    else:
+        n_open = len(open_pos_for_slots) if not open_pos_for_slots.empty else 0
     slots = max(0, MAX_OPEN_POSITIONS - n_open)
 
     # P1-19: içados pro chamador uma vez por ciclo, em vez de open_position

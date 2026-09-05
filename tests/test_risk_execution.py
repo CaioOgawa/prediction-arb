@@ -2488,6 +2488,22 @@ class TestRunExecutionGuardas:
         i_rebalance = self.SRC.index("rebalance_positions(open_pos_mtm, portfolio")
         assert i_stop < i_rebalance
 
+    def test_usa_flock_nao_bloqueante(self):
+        # R2: run_cycle.py já tinha esse lock (P1-20); run_execution.py roda
+        # 6x mais rápido (5min) e não tinha proteção nenhuma contra execução
+        # sobreposta — uma chamada de rede pendurada empilharia o próximo
+        # tick mutando as mesmas posições ao mesmo tempo.
+        assert "fcntl.flock" in self.SRC
+        assert "LOCK_EX | fcntl.LOCK_NB" in self.SRC
+
+    def test_slots_exclui_posicoes_travadas_pra_needs_manual_resolution(self):
+        # Mesmo filtro de paper_trader.run_paper_trading (P1-16): posição
+        # travada esperando revisão manual não deve inflar n_open aqui.
+        assert "needs_manual_resolution" in self.SRC
+        i_needs_manual = self.SRC.index('"needs_manual_resolution"')
+        i_slots = self.SRC.index("slots = max(0, MAX_OPEN_POSITIONS - n_open)")
+        assert i_needs_manual < i_slots
+
 
 class TestPaperTraderStopAntesDoRebalance:
     """P1-12: mesmo bug de ordem existia em run_paper_trading — rebalance
@@ -2500,6 +2516,28 @@ class TestPaperTraderStopAntesDoRebalance:
         i_stop = self.SRC.index("check_drawdown_stop(portfolio, DB_PATH")
         i_rebalance = self.SRC.index("rebalance_positions(open_pos_mtm, portfolio, dry_run=dry_run)")
         assert i_stop < i_rebalance
+
+
+class TestRunPaperTraderCliNaoDuplicaConstanteDoRiskManager:
+    """
+    R2: --min-liquidity e --top-signals tinham default literal (5_000.0/30)
+    no CLI em vez de None. run_paper_trading() já sabe cair pro
+    MIN_SIGNAL_LIQUIDITY/MAX_SIGNALS_PER_CYCLE do risk_manager quando recebe
+    None (mesmo padrão de --max-positions/--edge-threshold) — mas com
+    default literal essa branch nunca era alcançada quando run_cycle.py
+    chama este CLI sem passar as flags: o valor duplicado no client é que
+    valia, silenciosamente, e mudar a constante no risk_manager não
+    propagava pra esse caminho. Regra do próprio CLAUDE.md do projeto: não
+    duplicar constantes de risk_manager.py.
+    """
+
+    SRC = (ROOT / "execution" / "run_paper_trader.py").read_text()
+
+    def test_min_liquidity_default_e_none_nao_literal(self):
+        assert '@click.option("--min-liquidity",  default=None' in self.SRC
+
+    def test_top_signals_default_e_none_nao_literal(self):
+        assert '@click.option("--top-signals",    default=None' in self.SRC
 
 
 class TestOpenPositionUsaEntryPriceReal:

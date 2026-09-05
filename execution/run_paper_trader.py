@@ -43,10 +43,11 @@ console = Console()
 @click.option("--edge-threshold", default=None,    type=float,
               help="Pré-filtro de edge mínimo. Default: MIN_EDGE_ABS do risk_manager "
                    "(o gate por fonte é aplicado no sizing).")
-@click.option("--min-liquidity",  default=5_000.0, type=float, show_default=True,
-              help="Liquidez mínima do mercado em USDC.")
-@click.option("--top-signals",    default=30,      type=int,   show_default=True,
-              help="Quantos sinais (top por edge × confidence) avaliar por ciclo.")
+@click.option("--min-liquidity",  default=None,    type=float,
+              help="Liquidez mínima do mercado em USDC. Default: MIN_SIGNAL_LIQUIDITY do risk_manager.")
+@click.option("--top-signals",    default=None,    type=int,
+              help="Quantos sinais (top por edge × confidence) avaliar por ciclo. "
+                   "Default: MAX_SIGNALS_PER_CYCLE do risk_manager.")
 @click.option("--dry-run",        is_flag=True, default=False,
               help="Simula sem salvar posições no banco.")
 @click.option("--status",         is_flag=True, default=False,
@@ -56,8 +57,8 @@ def main(
     capital: float,
     max_positions: int | None,
     edge_threshold: float | None,
-    min_liquidity: float,
-    top_signals: int,
+    min_liquidity: float | None,
+    top_signals: int | None,
     dry_run: bool,
     status: bool,
 ) -> None:
