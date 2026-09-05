@@ -38,3 +38,25 @@ Thumbs.db
 
 # Relatórios de backtest (gerados)
 backtest/results/
+
+# Notas e ferramentas pessoais — fora do repo público (P2-41, 2026-09-05:
+# antes viviam em .git/info/exclude, local e invisível pra quem clonasse)
+CLAUDE.md
+.claude/
+GUIA_MELHORIAS.md
+graphify-out/
+.graphifyignore
+AUDITORIA_2026-07-09.md
+.zshrc
+
+# claude-code-runtime
+**/.claude/scheduled_tasks.lock
+**/.claude/scheduled_tasks.json
+**/.claude/routines/.state/
+**/.claude/worktrees/
+**/.claude/checkpoints/
+**/.claude/mailbox/
+**/.claude/agent-registry.json
+**/.claude/agent-memory-local
+**/.claude/first-run
+**/.claude/assistant-daemon-state.json
