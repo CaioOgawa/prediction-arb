@@ -13,14 +13,12 @@ preço real de entrada e o edge que sobra depois do spread e de fees.
 """
 
 import csv
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-from risk_manager import MIN_EDGE_TO_TRADE, TRANSACTION_FEE_PCT, MAX_SPREAD_TO_MIN_EDGE_RATIO
+from risk.risk_manager import MIN_EDGE_TO_TRADE, TRANSACTION_FEE_PCT, MAX_SPREAD_TO_MIN_EDGE_RATIO
 
 RAW_ODDS_DIR = Path("data/raw/odds")
 RAW_ODDS_DIR.mkdir(parents=True, exist_ok=True)

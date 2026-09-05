@@ -5,11 +5,10 @@ Gera um relatório HTML interativo (Plotly) em outputs/plots/eda_report.html
 e um resumo estatístico no terminal.
 
 Uso:
-    uv run python features/eda.py
-    uv run python features/eda.py --open   # abre o browser automaticamente
+    uv run python -m features.eda
+    uv run python -m features.eda --open   # abre o browser automaticamente
 """
 
-import sys
 import webbrowser
 import click
 from pathlib import Path
@@ -23,8 +22,6 @@ from plotly.subplots import make_subplots
 from rich.console import Console
 from rich.table import Table
 from rich import box
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 
 PLOTS_DIR = Path("outputs/plots")
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,7 +49,7 @@ def load_latest_features() -> pd.DataFrame:
     if not files:
         raise FileNotFoundError(
             "Nenhum arquivo de features encontrado. "
-            "Execute: uv run python features/feature_engineering.py"
+            "Execute: uv run python -m features.feature_engineering"
         )
     df = pd.read_parquet(files[0])
     console.print(f"[cyan]Features carregadas:[/cyan] {files[0].name} — {df.shape[0]:,} mercados × {df.shape[1]} features")

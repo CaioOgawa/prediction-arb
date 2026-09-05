@@ -14,7 +14,7 @@ import requests
 import pandas as pd
 from loguru import logger
 
-from db import init_db, get_connection
+from pipeline.db import init_db, get_connection
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 RAW_DIR = Path("data/raw/markets")

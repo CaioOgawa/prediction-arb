@@ -22,7 +22,6 @@ todas as pernas na mesma transação, trade_type='arb', hold até resolução.
 
 import contextlib
 import sqlite3
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -160,8 +159,7 @@ def get_open_positions() -> pd.DataFrame:
         # pega, porque 'nan' já é uma string válida do ponto de vista do
         # pandas). Sem isso, os limites por trade_type (MAX_MOMENTUM_POS/
         # MAX_VALUE_POS) nunca contam essas posições — o filtro não casa NaN.
-        sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-        from risk_manager import normalize_trade_type
+        from risk.risk_manager import normalize_trade_type
         df["trade_type"] = df["trade_type"].apply(lambda x: normalize_trade_type(x, warn=False))
     return df
 
@@ -224,8 +222,7 @@ def load_signals(mode: str = "odds", min_edge: float | None = None) -> pd.DataFr
     MAX_SIGNAL_AGE_MINUTES = 60
 
     if min_edge is None:
-        sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-        from risk_manager import MIN_EDGE_ABS
+        from risk.risk_manager import MIN_EDGE_ABS
         min_edge = MIN_EDGE_ABS  # pré-filtro coarse; o gate por fonte é do kelly_size
 
     def _load_pattern(pattern: str) -> pd.DataFrame:
@@ -294,10 +291,8 @@ def open_position(
     banco a cada candidato. None (default) mantém o comportamento antigo,
     buscando tudo internamente — é o que os testes existentes fazem.
     """
-    sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-    from risk_manager import kelly_size, check_exposure, MIN_EDGE_ABS, normalize_trade_type
-    sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-    from market_pricing import entry_price_and_net_edge
+    from risk.risk_manager import kelly_size, check_exposure, MIN_EDGE_ABS, normalize_trade_type
+    from pipeline.market_pricing import entry_price_and_net_edge
 
     direction    = str(signal.get("direction", ""))
     yes_price    = float(signal.get("yes_price", 0.5))
@@ -592,8 +587,7 @@ def open_basket(
 
     Retorna dict-resumo do basket ou None se rejeitado.
     """
-    sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-    from risk_manager import (
+    from risk.risk_manager import (
         ARB_MIN_PROFIT, ARB_MAX_BASKET_PCT, MAX_ARB_BASKETS,
         ARB_LIQUIDITY_FRAC, MAX_SOURCE_PCT,
     )
@@ -885,8 +879,7 @@ def rebalance_positions(
 
     Retorna lista de dicts com as adições realizadas.
     """
-    sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-    from risk_manager import kelly_size, normalize_trade_type
+    from risk.risk_manager import kelly_size, normalize_trade_type
 
     if open_positions_mtm.empty or "current_price" not in open_positions_mtm.columns:
         return []
@@ -1091,8 +1084,7 @@ def run_paper_trading(
       4. Abre novas posições via Kelly × confidence
       5. Mark-to-market e exibe portfólio
     """
-    sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-    from risk_manager import (
+    from risk.risk_manager import (
         resolve_positions, early_exit_positions, check_drawdown_stop,
         portfolio_risk_summary, MAX_OPEN_POSITIONS,
         MIN_SIGNAL_LIQUIDITY, MAX_SIGNALS_PER_CYCLE,
@@ -1141,7 +1133,6 @@ def run_paper_trading(
     if orphans:
         console.print(f"[bold yellow]Pernas de arb órfãs reclassificadas: {len(orphans)}[/bold yellow]")
         try:
-            sys.path.insert(0, str(Path(__file__).parent.parent))
             from notify import alert
             groups = sorted({o["arb_group"] for o in orphans})
             alert(
@@ -1164,7 +1155,6 @@ def run_paper_trading(
     if not stuck.empty:
         console.print(f"[bold red]Posições precisando de revisão manual: {len(stuck)}[/bold red]")
         try:
-            sys.path.insert(0, str(Path(__file__).parent.parent))
             from notify import alert
             questions = "; ".join(str(q)[:40] for q in stuck["question"].tolist())
             alert(
@@ -1249,7 +1239,7 @@ def run_paper_trading(
 
     if signals_df.empty:
         console.print(f"[yellow]Nenhum sinal disponível para modo '{mode}'.[/yellow]")
-        console.print(f"[dim]Execute: uv run python signals/run_signals.py --mode {mode}[/dim]\n")
+        console.print(f"[dim]Execute: uv run python -m signals.run_signals --mode {mode}[/dim]\n")
     else:
         # Filtra por liquidez
         if "liquidity" in signals_df.columns:

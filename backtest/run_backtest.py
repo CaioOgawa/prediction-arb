@@ -3,9 +3,9 @@ run_backtest.py
 CLI para o forward-test performance tracker.
 
 Uso:
-    uv run python backtest/run_backtest.py
-    uv run python backtest/run_backtest.py --html
-    uv run python backtest/run_backtest.py --html --open-browser
+    uv run python -m backtest.run_backtest
+    uv run python -m backtest.run_backtest --html
+    uv run python -m backtest.run_backtest --html --open-browser
 
 O tracker lê o SQLite do paper trader e computa métricas de performance
 das posições já fechadas. Quanto mais posições fecharem, mais ricas as métricas.
@@ -18,8 +18,6 @@ from pathlib import Path
 import click
 from loguru import logger
 from rich.console import Console
-
-sys.path.insert(0, str(Path(__file__).parent))
 
 console = Console()
 
@@ -42,7 +40,7 @@ def main(html: bool, open_browser: bool, db: str, output: str | None) -> None:
 
     console.print("\n[bold]Polymarket Quant — Forward Test Tracker[/bold]")
 
-    from backtest import (
+    from backtest.backtest import (
         load_positions, load_portfolio,
         print_backtest_summary, generate_html_report,
         DB_PATH,
@@ -51,7 +49,7 @@ def main(html: bool, open_browser: bool, db: str, output: str | None) -> None:
     db_path = Path(db)
     if not db_path.exists():
         console.print(f"[red]Banco não encontrado: {db_path}[/red]")
-        console.print("[dim]Execute primeiro: uv run python execution/run_paper_trader.py[/dim]")
+        console.print("[dim]Execute primeiro: uv run python -m execution.run_paper_trader[/dim]")
         sys.exit(1)
 
     closed, open_ = load_positions(db_path)
@@ -71,7 +69,7 @@ def main(html: bool, open_browser: bool, db: str, output: str | None) -> None:
             "\n[yellow]Dica:[/yellow] nenhuma posição fechada ainda — "
             "as métricas crescem conforme os mercados são resolvidos.\n"
             "[dim]Para resolver posições agora:[/dim]\n"
-            "[dim]  uv run python execution/run_paper_trader.py --mode all[/dim]"
+            "[dim]  uv run python -m execution.run_paper_trader --mode all[/dim]"
         )
 
 

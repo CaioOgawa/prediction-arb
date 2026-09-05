@@ -31,7 +31,6 @@ Uso manual:
 
 import atexit
 import fcntl
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,10 +48,6 @@ logger.add(
     level="INFO",
     format="{time:HH:mm:ss} | {level} | {message}",
 )
-
-sys.path.insert(0, str(Path(__file__).parent / "execution"))
-sys.path.insert(0, str(Path(__file__).parent / "risk"))
-sys.path.insert(0, str(Path(__file__).parent))
 
 # R2: run_cycle.py já tinha esse lock (P1-20) — este daemon roda 6x mais
 # rápido (StartInterval de 5min) e não tinha proteção nenhuma contra
@@ -74,7 +69,7 @@ def main(dry_run: bool, mode: str) -> None:
     Execution loop: resolve, early exits, abre posições, mark-to-market.
     Projetado para rodar a cada 5min enquanto run_cycle.py roda a cada 30min.
     """
-    from paper_trader import (
+    from execution.paper_trader import (
         DB_PATH,
         init_db,
         get_or_create_portfolio,
@@ -88,7 +83,7 @@ def main(dry_run: bool, mode: str) -> None:
         rebalance_positions,
         print_portfolio,
     )
-    from risk_manager import (
+    from risk.risk_manager import (
         resolve_positions, early_exit_positions, reclassify_orphan_arb_legs,
         check_drawdown_stop, MAX_OPEN_POSITIONS, MIN_SIGNAL_LIQUIDITY, MAX_SIGNALS_PER_CYCLE,
     )

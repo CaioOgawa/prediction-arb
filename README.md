@@ -52,10 +52,10 @@ All limits live in `risk/risk_manager.py` and are imported everywhere else — n
 uv sync
 cp .env.example .env        # fill in API keys (all optional except what you use)
 
-uv run python pipeline/validate_connection.py   # sanity-check the APIs
+uv run python -m pipeline.validate_connection   # sanity-check the APIs
 uv run python run_cycle.py --dry-run            # full cycle, nothing persisted
 uv run python run_cycle.py                      # light cycle for real
-uv run python execution/run_paper_trader.py --status
+uv run python -m execution.run_paper_trader --status
 uv run streamlit run dashboard/app.py           # http://localhost:8501
 
 uv run pytest                                   # 81 tests

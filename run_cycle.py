@@ -43,7 +43,6 @@ from loguru import logger
 # resolveria contra o CWD errado.
 os.chdir(Path(__file__).resolve().parent)
 
-sys.path.insert(0, str(Path(__file__).parent))
 from notify import alert, write_heartbeat, daily_summary, is_configured as telegram_configured
 
 LOGS_DIR = Path("logs")
@@ -114,7 +113,6 @@ def check_degradation(full: bool) -> list[str]:
     # 1b. Snapshot que o paper trader efetivamente carregaria (P0-2: seleção
     #     por nome escolhia markets_incremental_* velho em vez do mais recente)
     try:
-        sys.path.insert(0, str(Path(__file__).parent))
         from execution.paper_trader import load_current_markets, RAW_MKT_DIR
 
         selected = sorted(
@@ -274,7 +272,7 @@ def main(full: bool, dry_run: bool, html_report: bool) -> None:
         # (features/eda.py, congelado pelo ADR-008), não pro ciclo
         # automatizado. Sem isso, virou 3.106 arquivos / 15 GB em
         # outputs/reports sozinho.
-        ok = run(uv + ["pipeline/fetch_markets.py", "--no-report"], "fetch_markets")
+        ok = run(uv + ["-m", "pipeline.fetch_markets", "--no-report"], "fetch_markets")
         if not ok:
             failures.append("fetch_markets")
             logger.error("fetch_markets falhou — seguindo com o último snapshot válido (se ainda fresco)")
@@ -282,7 +280,7 @@ def main(full: bool, dry_run: bool, html_report: bool) -> None:
         # ── 2. Sinais odds — só no ciclo full ─────────────────
         if full:
             ok = run(
-                uv + ["signals/run_signals.py", "--mode", "odds", "--fetch-fresh"],
+                uv + ["-m", "signals.run_signals", "--mode", "odds", "--fetch-fresh"],
                 "signals_odds",
             )
             if not ok:
@@ -292,7 +290,7 @@ def main(full: bool, dry_run: bool, html_report: bool) -> None:
         # --min-hours-left 8: mercados com >= 8h até expiração
         # Evita gamma ruidoso das últimas horas; MIN_HOLD_HOURS=2 protege contra spikes.
         ok = run(
-            uv + ["signals/run_signals.py", "--mode", "deribit", "--fetch-fresh",
+            uv + ["-m", "signals.run_signals", "--mode", "deribit", "--fetch-fresh",
                   "--min-hours-left", "8"],
             "signals_deribit",
         )
@@ -303,7 +301,7 @@ def main(full: bool, dry_run: bool, html_report: bool) -> None:
         # CSV + alerta Telegram (garantidas); o paper trader (etapa 4) executa os
         # baskets garantidos atomicamente via open_basket().
         # NegRisk limitado a 40 eventos/ciclo (~40 requests à Gamma, sem quota).
-        ok = run(uv + ["signals/structural_arb.py"], "structural_arb")
+        ok = run(uv + ["-m", "signals.structural_arb"], "structural_arb")
         if not ok:
             failures.append("structural_arb")
 
@@ -311,7 +309,7 @@ def main(full: bool, dry_run: bool, html_report: bool) -> None:
         # Sempre modo "all": combina odds + deribit quando disponíveis.
         # Em ciclos light, o odds CSV estará stale (> MAX_SIGNAL_AGE_MINUTES) e
         # será ignorado automaticamente pelo paper_trader — sem quota desperdiçada.
-        trader_cmd  = uv + ["execution/run_paper_trader.py", "--mode", "all"]
+        trader_cmd  = uv + ["-m", "execution.run_paper_trader", "--mode", "all"]
         if dry_run:
             trader_cmd.append("--dry-run")
         ok = run(trader_cmd, "paper_trader")
@@ -322,12 +320,12 @@ def main(full: bool, dry_run: bool, html_report: bool) -> None:
         # P1-20: não pulado em --dry-run — só acrescenta parquet de
         # histórico, sem efeito monetário; mesma razão pra structural_arb
         # acima gravar seu CSV mesmo em dry-run.
-        ok = run(uv + ["pipeline/price_snapshot.py"], "price_snapshot")
+        ok = run(uv + ["-m", "pipeline.price_snapshot"], "price_snapshot")
         if not ok:
             failures.append("price_snapshot")
 
         # ── 6. Backtest / tracker de performance ─────────────
-        bt_cmd = uv + ["backtest/run_backtest.py"]
+        bt_cmd = uv + ["-m", "backtest.run_backtest"]
         if html_report:
             bt_cmd.append("--html")
         ok = run(bt_cmd, "backtest")
@@ -340,7 +338,7 @@ def main(full: bool, dry_run: bool, html_report: bool) -> None:
         if dry_run:
             logger.info("[db_maintenance] pulado (--dry-run)")
         else:
-            ok = run(uv + ["pipeline/db_maintenance.py", "--days", "14"], "db_maintenance")
+            ok = run(uv + ["-m", "pipeline.db_maintenance", "--days", "14"], "db_maintenance")
             if not ok:
                 failures.append("db_maintenance")
 
@@ -360,11 +358,9 @@ def main(full: bool, dry_run: bool, html_report: bool) -> None:
     # é papel dele). Sem portfólio ainda, não há o que resumir.
     # daily_summary() já se auto-limita a 1x/dia (hora < 1h UTC).
     try:
-        sys.path.insert(0, str(Path(__file__).parent / "risk"))
-        sys.path.insert(0, str(Path(__file__).parent / "execution"))
         import sqlite3 as _sqlite3
-        from risk_manager import portfolio_risk_summary
-        from paper_trader import DB_PATH, get_open_positions
+        from risk.risk_manager import portfolio_risk_summary
+        from execution.paper_trader import DB_PATH, get_open_positions
 
         _conn = _sqlite3.connect(DB_PATH)
         _row  = _conn.execute(

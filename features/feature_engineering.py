@@ -8,8 +8,8 @@ Três fontes de features:
   3. Microestrutura        → orderbook snapshots do SQLite
 
 Uso:
-    uv run python features/feature_engineering.py
-    uv run python features/feature_engineering.py --min-liquidity 5000
+    uv run python -m features.feature_engineering
+    uv run python -m features.feature_engineering --min-liquidity 5000
 """
 
 import sys
@@ -22,8 +22,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-from db import get_connection
+from pipeline.db import get_connection
 
 FEATURES_DIR = Path("data/raw/features")
 PRICES_DIR   = Path("data/raw/prices")

@@ -3,32 +3,28 @@ run_paper_trader.py
 Ponto de entrada do paper trader.
 
 Uso:
-    uv run python execution/run_paper_trader.py
-    uv run python execution/run_paper_trader.py --mode deribit
-    uv run python execution/run_paper_trader.py --mode all --dry-run
-    uv run python execution/run_paper_trader.py --status
+    uv run python -m execution.run_paper_trader
+    uv run python -m execution.run_paper_trader --mode deribit
+    uv run python -m execution.run_paper_trader --mode all --dry-run
+    uv run python -m execution.run_paper_trader --status
 
 Gerar sinais antes de operar:
-    uv run python signals/run_signals.py --mode odds   --fetch-fresh
-    uv run python signals/run_signals.py --mode deribit --fetch-fresh
+    uv run python -m signals.run_signals --mode odds   --fetch-fresh
+    uv run python -m signals.run_signals --mode deribit --fetch-fresh
 
 Ciclo completo (recomendado):
-    uv run python pipeline/fetch_markets.py
-    uv run python signals/run_signals.py --mode odds --fetch-fresh
-    uv run python signals/run_signals.py --mode deribit --fetch-fresh
-    uv run python execution/run_paper_trader.py --mode all
+    uv run python -m pipeline.fetch_markets
+    uv run python -m signals.run_signals --mode odds --fetch-fresh
+    uv run python -m signals.run_signals --mode deribit --fetch-fresh
+    uv run python -m execution.run_paper_trader --mode all
 """
 
 import sys
-from pathlib import Path
 
 import click
 import pandas as pd
 from loguru import logger
 from rich.console import Console
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
 
 console = Console()
 
@@ -68,7 +64,7 @@ def main(
 
     console.print("\n[bold]Polymarket Quant — Paper Trader[/bold]")
 
-    from paper_trader import (
+    from execution.paper_trader import (
         init_db, get_or_create_portfolio, get_open_positions,
         load_current_markets, mark_to_market, print_portfolio,
         run_paper_trading,
@@ -93,8 +89,8 @@ def main(
         mode=mode,
     )
 
-    console.print("\n[dim]Para atualizar: uv run python execution/run_paper_trader.py[/dim]")
-    console.print("[dim]Para status:    uv run python execution/run_paper_trader.py --status[/dim]")
+    console.print("\n[dim]Para atualizar: uv run python -m execution.run_paper_trader[/dim]")
+    console.print("[dim]Para status:    uv run python -m execution.run_paper_trader --status[/dim]")
 
 
 if __name__ == "__main__":

@@ -17,14 +17,10 @@ Rodar tudo incluindo integração (~60s):
 """
 
 import sqlite3
-import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
-
-# Garante que pipeline está no path
-sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 
 
 # ===========================================================================
@@ -48,7 +44,7 @@ class TestDB:
 
     def test_init_is_idempotent(self, tmp_db):
         """Chamar init_db duas vezes não deve lançar erro nem duplicar tabelas."""
-        import db
+        from pipeline import db
         db.init_db()
         db.init_db()  # segunda chamada — deve ser silenciosa
 
@@ -62,7 +58,7 @@ class TestDB:
 
     def test_upsert_inserts_new_market(self, tmp_db, mock_markets):
         """upsert_to_db deve inserir mercados novos no market_registry."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets(mock_markets)
         n = gamma_collector.upsert_to_db(df)
 
@@ -75,7 +71,7 @@ class TestDB:
 
     def test_upsert_no_duplicates(self, tmp_db, mock_markets):
         """Inserir os mesmos mercados duas vezes não deve duplicar registros."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets(mock_markets)
         gamma_collector.upsert_to_db(df)
         gamma_collector.upsert_to_db(df)  # segunda vez
@@ -88,7 +84,7 @@ class TestDB:
 
     def test_upsert_updates_existing_price(self, tmp_db, mock_markets):
         """upsert deve atualizar yes_price se o mercado já existia."""
-        import gamma_collector
+        from pipeline import gamma_collector
 
         # Insere versão inicial
         df_initial = gamma_collector._parse_markets(mock_markets)
@@ -111,7 +107,7 @@ class TestDB:
 
     def test_upsert_preserves_first_seen(self, tmp_db, mock_markets):
         """first_seen não deve ser sobrescrito em upserts subsequentes."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets(mock_markets)
         gamma_collector.upsert_to_db(df)
 
@@ -142,20 +138,20 @@ class TestDB:
 class TestParsing:
     def test_parse_returns_dataframe(self, mock_markets):
         """_parse_markets deve retornar um DataFrame não vazio."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets(mock_markets)
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 3
 
     def test_parse_yes_price_from_last_trade(self, mock_markets):
         """yes_price deve vir de lastTradePrice quando disponível."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets([mock_markets[0]])
         assert abs(df.iloc[0]["yes_price"] - 0.42) < 0.001
 
     def test_parse_yes_price_fallback_outcome_prices(self):
         """Sem lastTradePrice, deve usar outcomePrices[0] como fallback."""
-        import gamma_collector
+        from pipeline import gamma_collector
         market = {
             "conditionId": "0xfallback",
             "question": "Fallback test?",
@@ -171,20 +167,20 @@ class TestParsing:
 
     def test_parse_token_ids_extracted(self, mock_markets):
         """token_yes e token_no devem ser extraídos de clobTokenIds."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets([mock_markets[0]])
         assert df.iloc[0]["token_yes"] == "token_yes_001"
         assert df.iloc[0]["token_no"]  == "token_no_001"
 
     def test_parse_category_from_event(self, mock_markets):
         """Categoria deve ser herdada do evento pai quando ausente no mercado."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets([mock_markets[0]])
         assert df.iloc[0]["category"] == "Crypto"
 
     def test_parse_category_direct(self, mock_markets):
         """Categoria direta no mercado deve ser usada sem consultar evento."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets([mock_markets[2]])
         assert df.iloc[0]["category"] == "Crypto"
 
@@ -197,7 +193,7 @@ class TestParsing:
         palavra do slug, nunca uma categoria de verdade. Sem category/tag no
         evento, o resultado tem que ser "uncategorized", não um chute do slug.
         """
-        import gamma_collector
+        from pipeline import gamma_collector
         market = {
             "conditionId": "0xslug",
             "question": "Will Bitcoin reach $100k by December 31, 2026?",
@@ -212,7 +208,7 @@ class TestParsing:
         assert df.iloc[0]["category"] == "uncategorized"
 
     def test_parse_category_usa_tag_do_evento_quando_sem_category(self):
-        import gamma_collector
+        from pipeline import gamma_collector
         market = {
             "conditionId": "0xtag",
             "question": "Some question?",
@@ -228,7 +224,7 @@ class TestParsing:
 
     def test_parse_numeric_volumes(self, mock_markets):
         """volume, liquidity e volume24hr devem ser float."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets(mock_markets)
         assert df["volume"].dtype == float
         assert df["liquidity"].dtype == float
@@ -236,7 +232,7 @@ class TestParsing:
 
     def test_parse_missing_condition_id(self):
         """Mercado sem conditionId deve ser incluído no DataFrame mas sem cid."""
-        import gamma_collector
+        from pipeline import gamma_collector
         market = {"question": "No ID?", "volume": 100.0, "events": []}
         df = gamma_collector._parse_markets([market])
         assert len(df) == 1
@@ -262,8 +258,8 @@ class TestIncremental:
 
     def test_all_new_when_db_empty(self, mock_markets):
         """Com DB vazio, todos os mercados devem ser detectados como novos."""
-        import gamma_collector
-        from run_pipeline import _diff_markets
+        from pipeline import gamma_collector
+        from pipeline.run_pipeline import _diff_markets
 
         df = gamma_collector._parse_markets(mock_markets)
         new_df, updated_df, unchanged_df = _diff_markets(df, known={})
@@ -274,8 +270,8 @@ class TestIncremental:
 
     def test_unchanged_after_same_fetch(self, mock_markets):
         """Após upsert inicial, re-buscar os mesmos dados → tudo inalterado."""
-        import gamma_collector
-        from run_pipeline import _diff_markets
+        from pipeline import gamma_collector
+        from pipeline.run_pipeline import _diff_markets
 
         df = gamma_collector._parse_markets(mock_markets)
         known = self._make_known(df)
@@ -288,8 +284,8 @@ class TestIncremental:
 
     def test_detects_price_change(self, mock_markets):
         """Mudança de yes_price >= 0.001 deve ser detectada como atualização."""
-        import gamma_collector
-        from run_pipeline import _diff_markets
+        from pipeline import gamma_collector
+        from pipeline.run_pipeline import _diff_markets
 
         df_original = gamma_collector._parse_markets(mock_markets)
         known = self._make_known(df_original)
@@ -308,8 +304,8 @@ class TestIncremental:
 
     def test_detects_volume_change(self, mock_markets):
         """Aumento de volume >= 1 USDC deve ser detectado como atualização."""
-        import gamma_collector
-        from run_pipeline import _diff_markets
+        from pipeline import gamma_collector
+        from pipeline.run_pipeline import _diff_markets
 
         df = gamma_collector._parse_markets(mock_markets)
         known = self._make_known(df)
@@ -325,8 +321,8 @@ class TestIncremental:
 
     def test_detects_new_market(self, mock_markets):
         """Mercado com conditionId desconhecido deve aparecer como novo."""
-        import gamma_collector
-        from run_pipeline import _diff_markets
+        from pipeline import gamma_collector
+        from pipeline.run_pipeline import _diff_markets
 
         df_first = gamma_collector._parse_markets(mock_markets[:2])
         known = self._make_known(df_first)
@@ -340,8 +336,8 @@ class TestIncremental:
 
     def test_noise_below_threshold_not_detected(self, mock_markets):
         """Mudança de volume < 1 USDC não deve ser tratada como atualização."""
-        import gamma_collector
-        from run_pipeline import _diff_markets
+        from pipeline import gamma_collector
+        from pipeline.run_pipeline import _diff_markets
 
         df = gamma_collector._parse_markets(mock_markets)
         known = self._make_known(df)
@@ -364,7 +360,7 @@ class TestIncremental:
 class TestParquet:
     def test_snapshot_creates_file(self, tmp_raw_dir, tmp_db, mock_markets):
         """save_snapshot deve criar um arquivo .parquet no diretório correto."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets(mock_markets)
         path = gamma_collector.save_snapshot(df, tag="test")
 
@@ -374,7 +370,7 @@ class TestParquet:
 
     def test_parquet_roundtrip(self, tmp_raw_dir, tmp_db, mock_markets):
         """DataFrame salvo em Parquet deve ser idêntico ao relido."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets(mock_markets)
         path = gamma_collector.save_snapshot(df, tag="roundtrip")
 
@@ -384,7 +380,7 @@ class TestParquet:
 
     def test_parquet_preserves_numeric_types(self, tmp_raw_dir, tmp_db, mock_markets):
         """Tipos numéricos devem ser preservados após salvar/ler Parquet."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector._parse_markets(mock_markets)
         path = gamma_collector.save_snapshot(df, tag="types")
         df_read = pd.read_parquet(path)
@@ -400,7 +396,7 @@ class TestParquet:
 class TestPipelineRun:
     def test_run_log_created(self, tmp_db):
         """_log_run_start deve criar registro com status 'running'."""
-        from run_pipeline import _log_run_start, _log_run_end
+        from pipeline.run_pipeline import _log_run_start, _log_run_end
         run_id = _log_run_start("test_run")
 
         conn = sqlite3.connect(tmp_db)
@@ -414,7 +410,7 @@ class TestPipelineRun:
 
     def test_run_log_finished(self, tmp_db):
         """_log_run_end deve atualizar status para 'ok'."""
-        from run_pipeline import _log_run_start, _log_run_end
+        from pipeline.run_pipeline import _log_run_start, _log_run_end
         run_id = _log_run_start("test_run")
         _log_run_end(run_id, n_records=42, status="ok", notes="test")
 
@@ -446,7 +442,7 @@ class TestDbMaintenance:
         os.utime(path, (old_ts, old_ts))
 
     def test_prune_report_files_remove_so_padroes_conhecidos_e_antigos(self, tmp_path):
-        import db_maintenance
+        from pipeline import db_maintenance
         reports = tmp_path / "reports"
         raw = tmp_path / "raw"
         reports.mkdir()
@@ -484,7 +480,7 @@ class TestDbMaintenance:
         assert result["files_removed"] == 2
 
     def test_prune_report_files_dry_run_nao_apaga(self, tmp_path):
-        import db_maintenance
+        from pipeline import db_maintenance
         reports = tmp_path / "reports"
         reports.mkdir()
         old_eda = reports / "eda_markets_20260101_000000.csv"
@@ -499,7 +495,7 @@ class TestDbMaintenance:
         assert result["removed"] == [old_eda.name]
 
     def test_prune_price_history_dry_run_nao_apaga_nem_faz_vacuum(self, tmp_path):
-        import db_maintenance
+        from pipeline import db_maintenance
         db = tmp_path / "paper.db"
         conn = sqlite3.connect(db)
         conn.execute("""
@@ -526,7 +522,7 @@ class TestDbMaintenance:
         assert result["removed_corrupt"] == 1
 
     def test_prune_price_history_apaga_antigas_e_corrompidas(self, tmp_path):
-        import db_maintenance
+        from pipeline import db_maintenance
         db = tmp_path / "paper.db"
         conn = sqlite3.connect(db)
         conn.execute("""
@@ -562,20 +558,20 @@ class TestDbMaintenance:
 class TestIntegration:
     def test_gamma_api_returns_markets(self):
         """Gamma API deve retornar ao menos 10 mercados ativos."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector.fetch_markets(active=True, min_volume=0, limit=20, max_pages=1)
         assert len(df) >= 10, "Gamma API retornou menos de 10 mercados"
 
     def test_gamma_api_has_required_columns(self):
         """DataFrame retornado deve ter as colunas essenciais para o pipeline."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector.fetch_markets(active=True, min_volume=0, limit=10, max_pages=1)
         required = {"conditionId", "question", "volume", "liquidity", "yes_price"}
         assert required.issubset(set(df.columns))
 
     def test_gamma_api_prices_in_range(self):
         """yes_price deve estar entre 0 e 1 para mercados CLOB ativos."""
-        import gamma_collector
+        from pipeline import gamma_collector
         df = gamma_collector.fetch_markets(active=True, min_volume=1_000, limit=50, max_pages=1)
         prices = df["yes_price"].dropna()
         assert (prices >= 0).all(),  "yes_price com valor negativo encontrado"
@@ -587,7 +583,7 @@ class TestIntegration:
         1ª run → tudo novo
         2ª run → tudo inalterado (mesmo fetch)
         """
-        from run_pipeline import run_incremental
+        from pipeline.run_pipeline import run_incremental
 
         metrics1 = run_incremental(min_volume=100_000, dry_run=False)
         assert metrics1["n_new"]   > 0
@@ -624,7 +620,7 @@ class TestValidateConnection:
     odds_collector.py)."""
 
     def test_thegraph_ok_devolve_true(self, monkeypatch):
-        import validate_connection as vc
+        from pipeline import validate_connection as vc
         monkeypatch.setattr(
             vc.requests, "post",
             lambda *a, **kw: _FakeResp({"data": {"fixedProductMarketMakers": []}}),
@@ -632,14 +628,14 @@ class TestValidateConnection:
         assert vc.test_thegraph() is True
 
     def test_thegraph_erro_de_rede_devolve_false(self, monkeypatch):
-        import validate_connection as vc
+        from pipeline import validate_connection as vc
         def boom(*a, **kw):
             raise Exception("Connection refused")
         monkeypatch.setattr(vc.requests, "post", boom)
         assert vc.test_thegraph() is False
 
     def test_thegraph_resposta_com_errors_devolve_false(self, monkeypatch):
-        import validate_connection as vc
+        from pipeline import validate_connection as vc
         monkeypatch.setattr(
             vc.requests, "post",
             lambda *a, **kw: _FakeResp({"errors": ["subgraph indisponível"]}),
@@ -647,13 +643,13 @@ class TestValidateConnection:
         assert vc.test_thegraph() is False
 
     def test_check_env_vars_inclui_odds_api_key(self, capsys):
-        import validate_connection as vc
+        from pipeline import validate_connection as vc
         vc.check_env_vars()
         out = capsys.readouterr().out
         assert "ODDS_API_KEY" in out
 
     def test_check_env_vars_nao_checa_vars_mortas(self, capsys):
-        import validate_connection as vc
+        from pipeline import validate_connection as vc
         vc.check_env_vars()
         out = capsys.readouterr().out
         assert "POLY_PROXY_WALLET" not in out

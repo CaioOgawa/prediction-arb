@@ -11,7 +11,8 @@
         <string>/Users/caio/.local/bin/uv</string>
         <string>run</string>
         <string>python</string>
-        <string>/Users/caio/faculdade/projects/polymarket/pipeline/ws_feed.py</string>
+        <string>-m</string>
+        <string>pipeline.ws_feed</string>
     </array>
 
     <key>WorkingDirectory</key>

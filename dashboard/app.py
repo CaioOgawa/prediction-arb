@@ -22,8 +22,10 @@ import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT / "ml_lab"))
-sys.path.insert(0, str(ROOT / "risk"))
+# streamlit executa este arquivo como script solto (sys.path[0] = dashboard/),
+# não como `-m` — diferente dos outros entrypoints do projeto, aqui o insert
+# de ROOT é o jeito de tornar os pacotes internos (risk, pipeline, ...) importáveis.
+sys.path.insert(0, str(ROOT))
 
 DB_PATH     = ROOT / "data/db/paper_trading.db"
 MODELS_DIR  = ROOT / "outputs/models"
@@ -31,7 +33,7 @@ REPORTS_DIR = ROOT / "outputs/reports"
 LOGS_DIR    = ROOT / "logs"
 
 # ── Constantes de risco — importadas do risk_manager ───────
-from risk_manager import (  # noqa: E402
+from risk.risk_manager import (  # noqa: E402
     MAX_POSITION_PCT,
     MAX_CATEGORY_PCT,
     MAX_SOURCE_PCT,

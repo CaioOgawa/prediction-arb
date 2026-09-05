@@ -18,11 +18,8 @@ def tmp_db(tmp_path: Path, monkeypatch):
     Banco SQLite temporário isolado do banco real.
     Faz patch de DB_PATH em db.py para apontar ao diretório temporário.
     """
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-
     db_path = tmp_path / "test_polymarket.db"
-    import db as db_module
+    from pipeline import db as db_module
     monkeypatch.setattr(db_module, "DB_PATH", db_path)
     db_module.init_db()
     return db_path
@@ -37,9 +34,7 @@ def tmp_raw_dir(tmp_path: Path, monkeypatch):
     raw_dir = tmp_path / "raw" / "markets"
     raw_dir.mkdir(parents=True)
 
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-    import gamma_collector
+    from pipeline import gamma_collector
     monkeypatch.setattr(gamma_collector, "RAW_DIR", raw_dir)
     return raw_dir
 

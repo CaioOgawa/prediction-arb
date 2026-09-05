@@ -29,8 +29,8 @@ open_basket() (todas as pernas na mesma transação); oportunidades condicionais
 (YES-basket sem guarda-chuva, book cruzado) continuam report-only.
 
 Uso:
-    uv run python signals/structural_arb.py
-    uv run python signals/structural_arb.py --margin 0.01 --max-events 60
+    uv run python -m signals.structural_arb
+    uv run python -m signals.structural_arb --margin 0.01 --max-events 60
 """
 
 import re
@@ -47,11 +47,8 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from deribit_collector import parse_crypto_market, get_spot_price
-from risk_manager import ARB_MIN_PROFIT
+from pipeline.deribit_collector import parse_crypto_market, get_spot_price
+from risk.risk_manager import ARB_MIN_PROFIT
 
 GAMMA_BASE   = "https://gamma-api.polymarket.com"
 RAW_MKT_DIR  = Path("data/raw/markets")
@@ -84,7 +81,7 @@ def load_universe() -> pd.DataFrame:
     if not candidates:
         raise FileNotFoundError(
             f"Nenhum parquet de mercados em {RAW_MKT_DIR}. "
-            "Execute: uv run python pipeline/fetch_markets.py"
+            "Execute: uv run python -m pipeline.fetch_markets"
         )
     df = pd.read_parquet(candidates[0])
     logger.info(f"Universo: {len(df):,} mercados ({candidates[0].name})")

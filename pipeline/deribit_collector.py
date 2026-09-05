@@ -34,7 +34,7 @@ from rich.table import Table
 from rich import box
 from scipy.stats import norm
 
-from market_pricing import entry_price_and_net_edge
+from pipeline.market_pricing import entry_price_and_net_edge
 
 RAW_MKT_DIR   = Path("data/raw/markets")
 RAW_ODDS_DIR  = Path("data/raw/odds")
@@ -511,7 +511,7 @@ def load_active_markets(min_liquidity: float = 5_000) -> pd.DataFrame:
     if not candidates:
         raise FileNotFoundError(
             f"Nenhum arquivo de mercados em {RAW_MKT_DIR}. "
-            "Execute: uv run python pipeline/fetch_markets.py"
+            "Execute: uv run python -m pipeline.fetch_markets"
         )
     df = pd.read_parquet(candidates[0])
     if "active" in df.columns:
@@ -799,7 +799,7 @@ def print_signals_table(df: pd.DataFrame, top_n: int = 20) -> None:
     if df.empty:
         console.print("[yellow]Nenhum sinal encontrado.[/yellow]")
         console.print("  • Verifique se há mercados crypto ativos com preço entre 5% e 95%")
-        console.print("  • Execute: uv run python pipeline/fetch_markets.py\n")
+        console.print("  • Execute: uv run python -m pipeline.fetch_markets\n")
         return
 
     display = df.head(top_n)
@@ -876,6 +876,6 @@ if __name__ == "__main__":
 
         if not df.empty:
             console.print("[dim]Para integrar ao signal_generator:[/dim]")
-            console.print("[dim]  uv run python signals/run_signals.py --mode deribit[/dim]")
+            console.print("[dim]  uv run python -m signals.run_signals --mode deribit[/dim]")
 
     main()

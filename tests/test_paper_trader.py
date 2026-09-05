@@ -7,7 +7,6 @@ quando o segundo era muito mais recente.
 """
 
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -15,9 +14,8 @@ import pandas as pd
 import pytest
 
 ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT / "execution"))
 
-import paper_trader
+from execution import paper_trader
 
 
 def _write_snapshot(path: Path, mtime: float, n_rows: int = 1) -> None:

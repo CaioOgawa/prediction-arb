@@ -4,7 +4,7 @@ Testa a conectividade com todas as APIs do Polymarket antes de iniciar o projeto
 Execute após configurar o .env para garantir que tudo está funcionando.
 
 Uso:
-    python pipeline/validate_connection.py
+    python -m pipeline.validate_connection
 """
 
 import os
@@ -158,7 +158,7 @@ if __name__ == "__main__":
         print("=== Todas as conexoes validadas com sucesso! ===")
         print("\nProximos passos:")
         print("  1. Configure o .env com suas credenciais Polymarket")
-        print("  2. Execute: python pipeline/fetch_markets.py")
+        print("  2. Execute: python -m pipeline.fetch_markets")
         sys.exit(0)
     else:
         print("=== Algumas conexoes falharam. Verifique os erros acima. ===")

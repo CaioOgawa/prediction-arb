@@ -5,9 +5,9 @@ Detecta mercados novos vs. atualizados, registra cada run no SQLite
 e evita re-download de dados já coletados.
 
 Uso:
-    uv run python pipeline/run_pipeline.py
-    uv run python pipeline/run_pipeline.py --min-volume 10000
-    uv run python pipeline/run_pipeline.py --dry-run   (não salva nada)
+    uv run python -m pipeline.run_pipeline
+    uv run python -m pipeline.run_pipeline --min-volume 10000
+    uv run python -m pipeline.run_pipeline --dry-run   (não salva nada)
 """
 
 import sys
@@ -22,8 +22,8 @@ from rich import box
 
 import pandas as pd
 
-from db import init_db, get_connection
-from gamma_collector import fetch_markets, save_snapshot, upsert_to_db
+from pipeline.db import init_db, get_connection
+from pipeline.gamma_collector import fetch_markets, save_snapshot, upsert_to_db
 
 console = Console()
 

@@ -13,19 +13,16 @@ O modo ml foi APOSENTADO em 2026-07 (ADR-008): inferência incompatível com o
 bundle v2 + data leakage. O código segue congelado em ml_lab / signal_generator.
 
 Uso:
-    uv run python signals/run_signals.py
-    uv run python signals/run_signals.py --mode odds --edge-threshold 0.05
-    uv run python signals/run_signals.py --mode deribit --fetch-fresh
+    uv run python -m signals.run_signals
+    uv run python -m signals.run_signals --mode odds --edge-threshold 0.05
+    uv run python -m signals.run_signals --mode deribit --fetch-fresh
 """
 
 import sys
-from pathlib import Path
 
 import click
 from loguru import logger
 from rich.console import Console
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 
 console = Console()
 
@@ -76,14 +73,13 @@ def main(
 
     # Threshold default por fonte vem do risk_manager (fonte única de constantes).
     # --edge-threshold explícito sempre vence (antes, 0.08 explícito virava 0.05).
-    sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-    from risk_manager import MIN_EDGE_TO_TRADE
+    from risk.risk_manager import MIN_EDGE_TO_TRADE
     _edge = edge_threshold if edge_threshold is not None else MIN_EDGE_TO_TRADE.get(mode, 0.08)
 
     console.print(f"\n[bold]Polymarket Quant — Geração de Sinais[/bold]")
     console.print(f"Modo: [cyan]{mode.upper()}[/cyan]  |  edge ≥ {_edge:.0%}  |  liquidez ≥ ${min_liquidity:,.0f}\n")
 
-    from signal_generator import generate_odds_signals, generate_deribit_signals
+    from signals.signal_generator import generate_odds_signals, generate_deribit_signals
 
     if mode == "odds":
         signals = generate_odds_signals(
@@ -114,15 +110,15 @@ def main(
     if signals.empty:
         console.print("[yellow]Nenhum sinal gerado. Verifique os filtros ou atualize os dados.[/yellow]")
         if mode == "odds":
-            console.print("[dim]  → uv run python pipeline/fetch_markets.py   # atualiza mercados[/dim]")
-            console.print("[dim]  → uv run python signals/run_signals.py --mode odds --fetch-fresh[/dim]")
+            console.print("[dim]  → uv run python -m pipeline.fetch_markets   # atualiza mercados[/dim]")
+            console.print("[dim]  → uv run python -m signals.run_signals --mode odds --fetch-fresh[/dim]")
         sys.exit(0)
 
     dir_col   = signals["direction"].astype(str)
     n_buy_yes = (dir_col == "BUY_YES").sum()
     n_buy_no  = (dir_col == "BUY_NO").sum()
     console.print(f"[bold green]BUY_YES:[/bold green] {n_buy_yes}  |  [bold magenta]BUY_NO:[/bold magenta] {n_buy_no}")
-    console.print(f"\n[dim]Próximo passo: uv run python execution/run_paper_trader.py[/dim]")
+    console.print(f"\n[dim]Próximo passo: uv run python -m execution.run_paper_trader[/dim]")
 
 
 if __name__ == "__main__":

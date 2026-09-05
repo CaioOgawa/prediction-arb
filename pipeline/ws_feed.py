@@ -19,8 +19,8 @@ Resultado: early exit detectado no mesmo tick que o preço muda.
 Latência total: recv() + ~0.01ms (vs. recv() + 0.55ms no design anterior).
 
 Execução:
-    uv run python pipeline/ws_feed.py
-    uv run python pipeline/ws_feed.py --dry-run
+    uv run python -m pipeline.ws_feed
+    uv run python -m pipeline.ws_feed --dry-run
 """
 
 import asyncio
@@ -51,8 +51,7 @@ HISTORY_BATCH_MS     = 100   # flush price_history a cada 100ms
 # Importa parâmetros de early exit do risk_manager para manter consistência.
 # Fallback para valores conservadores se o import falhar.
 try:
-    sys.path.insert(0, str(ROOT / "risk"))
-    from risk_manager import EARLY_EXIT as _EARLY_EXIT, POSITION_STOP_LOSS
+    from risk.risk_manager import EARLY_EXIT as _EARLY_EXIT, POSITION_STOP_LOSS
     # Usa parâmetros do trade_type "value" como baseline (posições mais longas)
     _ee_value    = _EARLY_EXIT.get("value",    {})
     _ee_momentum = _EARLY_EXIT.get("momentum", {})

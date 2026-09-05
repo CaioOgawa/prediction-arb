@@ -15,10 +15,10 @@ Por que existe:
   histórico morto. Chegou a 15 GB / 11.556 arquivos em outputs/reports.
 
 Uso:
-    uv run python pipeline/db_maintenance.py                # retenção 14d
-    uv run python pipeline/db_maintenance.py --days 30
-    uv run python pipeline/db_maintenance.py --vacuum       # + VACUUM (lento, exclusivo)
-    uv run python pipeline/db_maintenance.py --dry-run      # só reporta o que apagaria
+    uv run python -m pipeline.db_maintenance                # retenção 14d
+    uv run python -m pipeline.db_maintenance --days 30
+    uv run python -m pipeline.db_maintenance --vacuum       # + VACUUM (lento, exclusivo)
+    uv run python -m pipeline.db_maintenance --dry-run      # só reporta o que apagaria
 
 Integrado ao run_cycle (1×/dia): retenção sem --vacuum é barata.
 

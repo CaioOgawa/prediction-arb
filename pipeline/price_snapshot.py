@@ -8,8 +8,8 @@ Objetivo: acumular histórico de preços para backtesting real (item 6.1 do guia
   - Appenda ao arquivo data/snapshots/price_history.parquet
 
 Execução:
-  uv run python pipeline/price_snapshot.py
-  uv run python pipeline/price_snapshot.py --db data/db/paper_trading.db
+  uv run python -m pipeline.price_snapshot
+  uv run python -m pipeline.price_snapshot --db data/db/paper_trading.db
 
 Integrado ao run_cycle.py para execução a cada ciclo (30min → dados horários acumulados).
 """

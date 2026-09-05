@@ -17,7 +17,6 @@ import ast
 import json
 import os
 import sqlite3
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,15 +26,9 @@ import pandas as pd
 import pytest
 
 ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT / "pipeline"))
-sys.path.insert(0, str(ROOT / "risk"))
 
-import ws_feed
-import gamma_collector
-import odds_collector
-import deribit_collector
-import market_pricing
-import risk_manager
+from pipeline import ws_feed, gamma_collector, odds_collector, deribit_collector, market_pricing
+from risk import risk_manager
 
 
 # ──────────────────────────────────────────────────────────
@@ -548,8 +541,7 @@ def trading_db(tmp_path):
     db = tmp_path / "paper.db"
     conn = sqlite3.connect(db)
     # Schema real do paper_trader (import tardio para evitar efeitos colaterais)
-    sys.path.insert(0, str(ROOT / "execution"))
-    import paper_trader
+    from execution import paper_trader
     conn.executescript(paper_trader.SCHEMA)
     # trade_type/needs_manual_resolution são colunas de migração (não estão no SCHEMA base)
     conn.execute("ALTER TABLE positions ADD COLUMN trade_type TEXT DEFAULT 'value'")
@@ -893,9 +885,8 @@ class TestKelly:
 # sim_backtest — paridade de Kelly com produção (P2-33)
 # ──────────────────────────────────────────────────────────
 
-sys.path.insert(0, str(ROOT / "backtest"))
-import sim_backtest
-import backtest as live_backtest
+from backtest import sim_backtest
+from backtest import backtest as live_backtest
 
 
 class TestSimBacktestKellyParity:
@@ -1395,9 +1386,8 @@ class TestDiscountSweep:
 # structural_arb — detectores puros (Fase 2)
 # ──────────────────────────────────────────────────────────
 
-sys.path.insert(0, str(ROOT / "signals"))
-import structural_arb
-import signal_generator
+from signals import structural_arb
+from signals import signal_generator
 
 
 class TestNegRiskBasket:
@@ -1540,8 +1530,7 @@ class TestCrossedBook:
 # open_basket — execução atômica de baskets (Fase 2)
 # ──────────────────────────────────────────────────────────
 
-sys.path.insert(0, str(ROOT / "execution"))
-import paper_trader
+from execution import paper_trader
 
 
 @pytest.fixture()
@@ -2035,8 +2024,7 @@ class TestNormalizeTradeType:
 
 class TestGetOpenPositionsNormalizaTradeType:
     def test_string_nan_do_banco_vira_value_na_leitura(self, tmp_path, monkeypatch):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = tmp_path / "paper.db"
         conn = sqlite3.connect(db)
         conn.executescript(paper_trader.SCHEMA)
@@ -2070,8 +2058,7 @@ class TestRebalancePositionsCorrigido:
 
     def _seed_db(self, tmp_path, trade_type="value", cost_usdc=10.0, shares=100.0,
                  entry_price=0.10, prob_at_entry=0.60, confidence=1.0, signal_source="odds"):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = tmp_path / "paper.db"
         conn = sqlite3.connect(db)
         conn.executescript(paper_trader.SCHEMA)
@@ -2094,8 +2081,7 @@ class TestRebalancePositionsCorrigido:
     }])
 
     def test_pula_pernas_de_arb(self, tmp_path, monkeypatch):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = self._seed_db(tmp_path, trade_type="arb")
         monkeypatch.setattr(paper_trader, "DB_PATH", db)
 
@@ -2112,8 +2098,7 @@ class TestRebalancePositionsCorrigido:
         assert float(pos["cost_usdc"]) == 10.0
 
     def test_compra_no_ask_nao_no_bid(self, tmp_path, monkeypatch):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = self._seed_db(tmp_path, trade_type="value")
         monkeypatch.setattr(paper_trader, "DB_PATH", db)
 
@@ -2140,8 +2125,7 @@ class TestRebalancePositionsCorrigido:
         # P1-17: uma posição com trade_type='nan' (contaminação real já
         # encontrada em produção) não pode travar o rebalance nem ser tratada
         # como arb por acidente — normalize_trade_type cai pra 'value'.
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = self._seed_db(tmp_path, trade_type="nan")
         monkeypatch.setattr(paper_trader, "DB_PATH", db)
 
@@ -2163,8 +2147,7 @@ class TestMarkToMarketUsaBookReal:
     """
 
     def _seed_db(self, tmp_path, direction="BUY_YES"):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = tmp_path / "paper.db"
         conn = sqlite3.connect(db)
         conn.executescript(paper_trader.SCHEMA)
@@ -2180,8 +2163,7 @@ class TestMarkToMarketUsaBookReal:
         return db
 
     def test_buy_yes_usa_bid_nao_yes_price_menos_meio_spread(self, tmp_path, monkeypatch):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = self._seed_db(tmp_path, direction="BUY_YES")
         monkeypatch.setattr(paper_trader, "DB_PATH", db)
 
@@ -2196,8 +2178,7 @@ class TestMarkToMarketUsaBookReal:
         assert mtm.iloc[0]["current_price"] == pytest.approx(0.52)
 
     def test_buy_no_usa_1_menos_ask_nao_yes_price(self, tmp_path, monkeypatch):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = self._seed_db(tmp_path, direction="BUY_NO")
         monkeypatch.setattr(paper_trader, "DB_PATH", db)
 
@@ -2212,8 +2193,7 @@ class TestMarkToMarketUsaBookReal:
         assert mtm.iloc[0]["current_price"] == pytest.approx(0.42)
 
     def test_sem_bestbid_bestask_cai_pro_fallback_legado(self, tmp_path, monkeypatch):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = self._seed_db(tmp_path, direction="BUY_YES")
         monkeypatch.setattr(paper_trader, "DB_PATH", db)
 
@@ -2230,8 +2210,7 @@ class TestMtmOpenValueUsaBookReal:
     """Mesma correção de TestMarkToMarketUsaBookReal, agora em backtest._mtm_open_value."""
 
     def test_buy_no_usa_1_menos_ask(self, tmp_path, monkeypatch):
-        sys.path.insert(0, str(ROOT / "backtest"))
-        import backtest as bt
+        from backtest import backtest as bt
 
         raw_dir = tmp_path / "data" / "raw" / "markets"
         raw_dir.mkdir(parents=True)
@@ -2250,8 +2229,7 @@ class TestMtmOpenValueUsaBookReal:
         assert value == pytest.approx(0.42 * 100.0, abs=0.01)
 
     def test_escolhe_por_mtime_nao_por_nome(self, tmp_path, monkeypatch):
-        sys.path.insert(0, str(ROOT / "backtest"))
-        import backtest as bt
+        from backtest import backtest as bt
 
         raw_dir = tmp_path / "data" / "raw" / "markets"
         raw_dir.mkdir(parents=True)
@@ -2309,8 +2287,7 @@ class TestKellyCorrelacao:
         # P1-11d (revisão advisor): quando o Kelly some por causa de n_correlated
         # (não por edge/capital pequenos), o log precisa dizer "correlacao",
         # senão "kelly_pequeno" vira motivo genérico pra dois bugs diferentes.
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         from loguru import logger as loguru_logger
 
         logged: list[str] = []
@@ -2363,8 +2340,7 @@ class TestDrawdownPico:
 
     @pytest.fixture()
     def empty_db(self, tmp_path):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         db = tmp_path / "paper.db"
         conn = sqlite3.connect(db)
         conn.executescript(paper_trader.SCHEMA)
@@ -2572,8 +2548,7 @@ class TestOpenPositionUsaEntryPriceReal:
         return portfolio, signal
 
     def test_com_entry_price_real_nao_reconstroi_de_yes_price(self, monkeypatch):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         monkeypatch.setattr(paper_trader, "load_current_markets", lambda: pd.DataFrame())
         monkeypatch.setattr(paper_trader, "get_open_positions", lambda: pd.DataFrame())
 
@@ -2587,8 +2562,7 @@ class TestOpenPositionUsaEntryPriceReal:
         assert pos["entry_price"] == pytest.approx(0.53)
 
     def test_sem_entry_price_cai_pro_legado_yes_price_mais_meio_spread(self, monkeypatch):
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         monkeypatch.setattr(paper_trader, "load_current_markets", lambda: pd.DataFrame())
         monkeypatch.setattr(paper_trader, "get_open_positions", lambda: pd.DataFrame())
 
@@ -2603,8 +2577,7 @@ class TestOpenPositionUsaEntryPriceReal:
     def test_nao_desconta_spread_duas_vezes_com_entry_price_real(self, monkeypatch):
         # Regressão específica: liquidity > 0 soma impacto de mercado. Com
         # real_entry_price, NÃO deve somar effective_spread/2 de novo por cima.
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         monkeypatch.setattr(paper_trader, "load_current_markets", lambda: pd.DataFrame())
         monkeypatch.setattr(paper_trader, "get_open_positions", lambda: pd.DataFrame())
 
@@ -2619,8 +2592,7 @@ class TestOpenPositionUsaEntryPriceReal:
     def test_re_cotacao_prefere_book_fresco_sobre_entry_price_do_sinal(self, monkeypatch):
         # current_mkts tem um bestAsk mais barato que o gravado no sinal (book
         # melhorou) — a versão fresca deve vencer, não o valor stale do sinal.
-        sys.path.insert(0, str(ROOT / "execution"))
-        import paper_trader
+        from execution import paper_trader
         fresh_mkts = pd.DataFrame([{
             "conditionId": "0xnovo", "yes_price": 0.50, "spread": 0.02,
             "bestBid": 0.485, "bestAsk": 0.495,
@@ -2662,7 +2634,7 @@ class TestOpenPositionIgnoraPosicoesTravadas:
     }
 
     def test_posicoes_travadas_nao_contam_no_limite_global(self):
-        from risk_manager import check_exposure, MAX_OPEN_POSITIONS
+        from risk.risk_manager import check_exposure, MAX_OPEN_POSITIONS
 
         ok, reason = check_exposure(
             self.SIGNAL, self._travadas(MAX_OPEN_POSITIONS),
@@ -2676,7 +2648,7 @@ class TestOpenPositionIgnoraPosicoesTravadas:
     def test_duplicata_de_posicao_travada_continua_bloqueada(self):
         # A exclusão do limite global NÃO pode furar a checagem de duplicata —
         # a posição travada continua com capital de verdade comprometido nela.
-        from risk_manager import check_exposure, MAX_OPEN_POSITIONS
+        from risk.risk_manager import check_exposure, MAX_OPEN_POSITIONS
 
         signal = {**self.SIGNAL, "condition_id": "0x0"}  # mesmo cid de uma posição travada
         ok, reason = check_exposure(
@@ -2696,7 +2668,6 @@ class TestArbAlert:
 
     @pytest.fixture()
     def notify_mod(self, tmp_path, monkeypatch):
-        sys.path.insert(0, str(ROOT))
         import notify
         monkeypatch.setattr(notify, "ARB_ALERT_STATE", tmp_path / "state.json")
         sent = []
@@ -3527,7 +3498,7 @@ class TestRunCycleTimeoutELock:
         # 1/4 dos ciclos de trading pra pouco ganho. Fica soft, sinais/
         # paper_trader seguem rodando (e degradam pra no-op sozinhos se o
         # snapshot ficar velho demais).
-        i_fetch = self.SRC.index('run(uv + ["pipeline/fetch_markets.py"')
+        i_fetch = self.SRC.index('run(uv + ["-m", "pipeline.fetch_markets"')
         i_odds_step = self.SRC.index("# ── 2. Sinais odds")
         assert i_fetch < i_odds_step
         body_between = self.SRC[i_fetch:i_odds_step]
@@ -3547,7 +3518,7 @@ class TestRunCycleTimeoutELock:
         # fetch_markets.py) é pra exploração manual, não pro ciclo
         # automatizado — virou 3.106 arquivos / 15 GB sozinho em
         # outputs/reports sem isso.
-        assert '"pipeline/fetch_markets.py", "--no-report"' in self.SRC
+        assert '"-m", "pipeline.fetch_markets", "--no-report"' in self.SRC
 
     def test_log_proprio_com_rotacao(self):
         i_add = self.SRC.index("logger.add(")

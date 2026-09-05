@@ -14,7 +14,7 @@ import pandas as pd
 from loguru import logger
 from dotenv import load_dotenv
 
-from db import init_db, get_connection
+from pipeline.db import init_db, get_connection
 
 load_dotenv()
 

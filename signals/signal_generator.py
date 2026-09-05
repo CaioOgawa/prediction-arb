@@ -25,7 +25,6 @@ Fluxo (modo ml):
 """
 
 import pickle
-import sys
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -101,7 +100,7 @@ def load_active_markets() -> pd.DataFrame:
     if not candidates:
         raise FileNotFoundError(
             f"Nenhum arquivo de mercados em {RAW_DIR}. "
-            "Execute primeiro: uv run python pipeline/fetch_markets.py"
+            "Execute primeiro: uv run python -m pipeline.fetch_markets"
         )
     path = candidates[0]
     logger.info(f"Carregando mercados: {path.name}")
@@ -361,13 +360,13 @@ def _confidence_score(
 def load_latest_odds() -> pd.DataFrame:
     """
     Carrega o arquivo de odds matched mais recente de data/raw/odds/.
-    Gerado por: uv run python pipeline/odds_collector.py
+    Gerado por: uv run python -m pipeline.odds_collector
     """
     candidates = sorted(RAW_ODDS_DIR.glob("odds_matched_*.parquet"), reverse=True)
     if not candidates:
         raise FileNotFoundError(
             f"Nenhum arquivo de odds em {RAW_ODDS_DIR}. "
-            "Execute: uv run python pipeline/odds_collector.py"
+            "Execute: uv run python -m pipeline.odds_collector"
         )
     path = candidates[0]
     # total_seconds(), não .seconds — este último dá wrap a cada 24h no log
@@ -404,8 +403,7 @@ def generate_odds_signals(
     """
     if fetch_fresh:
         logger.info("Coletando odds frescos...")
-        sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-        from odds_collector import run as collect_odds
+        from pipeline.odds_collector import run as collect_odds
         collect_odds(min_divergence=0.0, save=True)
 
     odds_df = load_latest_odds()
@@ -518,8 +516,8 @@ def _print_odds_signals_table(signals: pd.DataFrame, top_n: int = 20) -> None:
         console.print("[yellow]Nenhum sinal encontrado com os filtros atuais.[/yellow]")
         console.print("Sugestões:")
         console.print("  • Reduza --edge-threshold")
-        console.print("  • Execute: uv run python pipeline/odds_collector.py  (atualiza odds)")
-        console.print("  • Execute: uv run python pipeline/fetch_markets.py   (atualiza mercados)\n")
+        console.print("  • Execute: uv run python -m pipeline.odds_collector  (atualiza odds)")
+        console.print("  • Execute: uv run python -m pipeline.fetch_markets   (atualiza mercados)\n")
         return
 
     display = signals.head(top_n)
@@ -597,8 +595,7 @@ def generate_deribit_signals(
     Returns:
         DataFrame de sinais com fair_prob, divergence e confidence score.
     """
-    sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-    from deribit_collector import run as collect_deribit
+    from pipeline.deribit_collector import run as collect_deribit
 
     if fetch_fresh:
         logger.info("Coletando dados frescos do Deribit...")
@@ -697,8 +694,8 @@ def _print_deribit_signals_table(signals: pd.DataFrame, top_n: int = 20) -> None
         console.print("[yellow]Nenhum sinal encontrado.[/yellow]")
         console.print("Sugestões:")
         console.print("  • Reduza --edge-threshold (mínimo recomendado: 0.05)")
-        console.print("  • Execute: uv run python pipeline/fetch_markets.py  (atualiza mercados)")
-        console.print("  • Execute: uv run python signals/run_signals.py --mode deribit --fetch-fresh\n")
+        console.print("  • Execute: uv run python -m pipeline.fetch_markets  (atualiza mercados)")
+        console.print("  • Execute: uv run python -m signals.run_signals --mode deribit --fetch-fresh\n")
         return
 
     console.print(

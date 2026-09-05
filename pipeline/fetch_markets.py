@@ -4,9 +4,9 @@ Script principal da Fase 1: coleta mercados ativos via Gamma API,
 salva em SQLite + Parquet e gera relatório EDA inicial.
 
 Uso:
-    uv run python pipeline/fetch_markets.py
-    uv run python pipeline/fetch_markets.py --min-volume 10000
-    uv run python pipeline/fetch_markets.py --min-volume 0 --no-report
+    uv run python -m pipeline.fetch_markets
+    uv run python -m pipeline.fetch_markets --min-volume 10000
+    uv run python -m pipeline.fetch_markets --min-volume 0 --no-report
 """
 
 import sys
@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-from gamma_collector import run as collect_markets, EmptySnapshotError
+from pipeline.gamma_collector import run as collect_markets, EmptySnapshotError
 
 console = Console()
 
@@ -182,9 +182,9 @@ def _eda_report(df: pd.DataFrame) -> None:
     # --- Próximos passos ---
     console.print("\n[bold yellow]Próximos passos:[/bold yellow]")
     console.print("  1. Configure credenciais no .env (POLY_API_KEY etc.)")
-    console.print("  2. Execute: uv run python pipeline/clob_collector.py")
+    console.print("  2. Execute: uv run python -m pipeline.clob_collector")
     console.print("     → coleta histórico de preços dos top mercados")
-    console.print("  3. Execute: uv run python features/feature_engineering.py")
+    console.print("  3. Execute: uv run python -m features.feature_engineering")
     console.print("     → constrói features para os modelos de ML\n")
 
 

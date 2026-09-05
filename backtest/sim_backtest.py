@@ -53,14 +53,13 @@ de ~21 de agosto de 2026 — checar `data/raw/markets/` pra saber o que há hoje
 Passo: 1 dia (limitado pela granularidade do DVOL).
 
 Uso:
-  uv run python backtest/sim_backtest.py
-  uv run python backtest/sim_backtest.py --days 200 --min-conviction 0.08
-  uv run python backtest/sim_backtest.py --html
-  uv run python backtest/sim_backtest.py --discount-sweep
+  uv run python -m backtest.sim_backtest
+  uv run python -m backtest.sim_backtest --days 200 --min-conviction 0.08
+  uv run python -m backtest.sim_backtest --html
+  uv run python -m backtest.sim_backtest --discount-sweep
 """
 
 import json
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -74,9 +73,7 @@ import requests
 from loguru import logger
 from scipy.stats import norm
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-sys.path.insert(0, str(Path(__file__).parent.parent / "risk"))
-from deribit_collector import (
+from pipeline.deribit_collector import (
     ASSET_DRIFT,
     MAX_MONEYNESS_SIGMA,
     MAX_YES_FOR_BUY_NO,
@@ -86,7 +83,7 @@ from deribit_collector import (
 # Constantes de risco vêm do risk_manager — a simulação deve usar OS MESMOS
 # parâmetros da produção, senão o backtest mede outra estratégia (bug da auditoria:
 # valores duplicados aqui divergiam, ex: MAX_POSITION_PCT 0.10 vs 0.03 real).
-from risk_manager import (
+from risk.risk_manager import (
     EARLY_EXIT as _EARLY_EXIT,
     KELLY_MAX_FRAC,
     kelly_size as _kelly_size_shared,

@@ -12,8 +12,8 @@ Estratégia:
   5. Salva pares matched em Parquet para uso no signal_generator
 
 Uso:
-    uv run python pipeline/odds_collector.py
-    uv run python pipeline/odds_collector.py --sport mlb --min-divergence 0.05
+    uv run python -m pipeline.odds_collector
+    uv run python -m pipeline.odds_collector --sport mlb --min-divergence 0.05
 
 API key gratuita em: https://the-odds-api.com (500 req/mês no plano free)
 Coloque ODDS_API_KEY no .env
@@ -25,7 +25,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from market_pricing import (
+from pipeline.market_pricing import (
     entry_price_and_net_edge, apply_edge_shrinkage, log_rejected_implausible_edge,
 )
 
@@ -1212,7 +1212,7 @@ def load_active_markets(min_liquidity: float = 1_000) -> pd.DataFrame:
     if not candidates:
         raise FileNotFoundError(
             f"Nenhum arquivo de mercados em {RAW_MKT_DIR}. "
-            "Execute: uv run python pipeline/fetch_markets.py"
+            "Execute: uv run python -m pipeline.fetch_markets"
         )
     df = pd.read_parquet(candidates[0])
 
@@ -1489,7 +1489,7 @@ if __name__ == "__main__":
         if not df.empty:
             console.print(
                 "\n[dim]Para usar esses sinais no paper trader:[/dim]"
-                "\n[dim]  uv run python signals/run_signals.py --mode odds[/dim]"
+                "\n[dim]  uv run python -m signals.run_signals --mode odds[/dim]"
             )
 
     main()
