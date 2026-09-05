@@ -540,9 +540,17 @@ if page == "Visão Geral":
                 "Expira":       str(pos.get("end_date", ""))[:10],
             }
             if live.get("best_bid") and live.get("best_ask"):
+                # Mesma fórmula de risk_manager.early_exit_positions/
+                # ws_feed.evaluate_exit: vender a mercado executa no bid (ou
+                # 1-ask pra BUY_NO). A versão antiga usava "bid - spread/2"
+                # pras duas direções — descontava o spread duas vezes E
+                # ignorava a direção real da posição (BUY_NO sempre mostrava
+                # o preço de BUY_YES).
                 direction  = str(pos.get("direction", ""))
-                spread_val = live["best_ask"] - live["best_bid"]
-                exit_px    = max(live["best_bid"] - spread_val / 2, 0.001)
+                if direction == "BUY_NO":
+                    exit_px = max(1.0 - live["best_ask"], 0.001)
+                else:
+                    exit_px = max(live["best_bid"], 0.001)
                 shares     = float(pos.get("shares", 0))
                 cost       = float(pos.get("cost_usdc", 1))
                 cur_val    = exit_px * shares
@@ -567,8 +575,13 @@ if page == "Visão Geral":
             shares  = float(pos["shares"])
             bid     = live["best_bid"]
             ask     = live["best_ask"]
-            spread_v = ask - bid
-            exit_px  = max(bid - spread_v / 2, 0.001)
+            # Mesma fórmula de risk_manager.early_exit_positions — a versão
+            # antiga era direction-blind (sempre bid - spread/2, errado pra
+            # BUY_NO) igual à tabela acima.
+            if str(pos.get("direction", "")) == "BUY_NO":
+                exit_px = max(1.0 - ask, 0.001)
+            else:
+                exit_px = max(bid, 0.001)
             cur_val  = exit_px * shares
             mult     = cur_val / cost if cost > 0 else 0
 

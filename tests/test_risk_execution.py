@@ -14,6 +14,8 @@ Origem (auditoria 2026-07-09, ver AUDITORIA_2026-07-09.md):
 """
 
 import ast
+import json
+import os
 import sqlite3
 import sys
 import time
@@ -89,6 +91,71 @@ class TestEvaluateExit:
     def test_watch_nunca_dispara(self):
         info = ws_feed.AssetInfo("t", "c", "q", "WATCH", 0, 0, 0, 0)
         assert ws_feed.evaluate_exit(info, 0.18, 0.19) is None
+
+
+class TestBuildAssetMapEscolheSnapshotPorMtime:
+    """
+    R1: build_asset_map só olhava markets_all_* e ordenava por NOME, o mesmo
+    bug de P0-2 (load_current_markets) só que sem o fix — perdia
+    markets_incremental_* inteiramente e podia pegar um arquivo mais velho
+    quando o nome ordenava errado.
+    """
+
+    def _empty_positions_db(self, path):
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE positions (status TEXT)")
+        conn.commit()
+        conn.close()
+
+    def _write(self, path, mtime, condition_id):
+        # active/yes_price/liquidity habilitam o ramo "top mercados" de
+        # build_asset_map sem precisar de posição real na tabela positions.
+        df = pd.DataFrame({
+            "conditionId":  [condition_id],
+            "clobTokenIds": [json.dumps(["t1", "t2"])],
+            "question":     ["Q?"],
+            "active":       [True],
+            "yes_price":    [0.5],
+            "liquidity":    [10_000.0],
+        })
+        df.to_parquet(path)
+        os.utime(path, (mtime, mtime))
+
+    def test_incremental_mais_novo_vence_all_mais_antigo(self, tmp_path, monkeypatch):
+        raw_dir = tmp_path / "data" / "raw" / "markets"
+        raw_dir.mkdir(parents=True)
+        db = tmp_path / "paper.db"
+        self._empty_positions_db(db)
+        monkeypatch.setattr(ws_feed, "ROOT", tmp_path)
+        monkeypatch.setattr(ws_feed, "DB_PATH", db)
+
+        now = time.time()
+        self._write(raw_dir / "markets_all_20260101_000000.parquet", now - 3600, "0xold")
+        self._write(raw_dir / "markets_incremental_20260102_000000.parquet", now, "0xnew")
+
+        asset_map = ws_feed.build_asset_map()
+        cids = {info.condition_id for info in asset_map.values()}
+        assert "0xnew" in cids
+        assert "0xold" not in cids
+
+    def test_ordena_por_mtime_nao_por_nome(self, tmp_path, monkeypatch):
+        # Nome alfabeticamente "maior" mas mtime mais antigo — só passa se a
+        # ordenação for por mtime.
+        raw_dir = tmp_path / "data" / "raw" / "markets"
+        raw_dir.mkdir(parents=True)
+        db = tmp_path / "paper.db"
+        self._empty_positions_db(db)
+        monkeypatch.setattr(ws_feed, "ROOT", tmp_path)
+        monkeypatch.setattr(ws_feed, "DB_PATH", db)
+
+        now = time.time()
+        self._write(raw_dir / "markets_all_99999999_999999.parquet", now - 3600, "0xold")
+        self._write(raw_dir / "markets_all_00000000_000000.parquet", now, "0xnew")
+
+        asset_map = ws_feed.build_asset_map()
+        cids = {info.condition_id for info in asset_map.values()}
+        assert "0xnew" in cids
+        assert "0xold" not in cids
 
 
 # ──────────────────────────────────────────────────────────
@@ -2084,6 +2151,130 @@ class TestRebalancePositionsCorrigido:
         result = paper_trader.rebalance_positions(mtm, portfolio, dry_run=True)
 
         assert len(result) == 1  # tratado como 'value', não pulado como se fosse 'arb'
+
+
+class TestMarkToMarketUsaBookReal:
+    """
+    R1: mark_to_market só olhava yes_price/spread (fórmula "yes - spread/2",
+    que desconta o spread duas vezes — vender a mercado executa no bid de
+    verdade) mesmo quando o snapshot já trazia bestBid/bestAsk. Agora usa o
+    book quando disponível, mesma fórmula de
+    risk_manager.early_exit_positions/ws_feed.evaluate_exit.
+    """
+
+    def _seed_db(self, tmp_path, direction="BUY_YES"):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = tmp_path / "paper.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(paper_trader.SCHEMA)
+        conn.execute("ALTER TABLE positions ADD COLUMN trade_type TEXT DEFAULT 'value'")
+        conn.execute("""
+            INSERT INTO positions
+              (condition_id, question, direction, entry_price, shares, cost_usdc,
+               prob_at_entry, confidence, signal_source, status, trade_type, opened_at)
+            VALUES ('0xbbb', 'Teste?', ?, 0.50, 100.0, 50.0, 0.50, 1.0, 'odds', 'open', 'value', '2026-01-01 00:00:00')
+        """, (direction,))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_buy_yes_usa_bid_nao_yes_price_menos_meio_spread(self, tmp_path, monkeypatch):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = self._seed_db(tmp_path, direction="BUY_YES")
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+
+        mkt = pd.DataFrame([{
+            "conditionId": "0xbbb", "yes_price": 0.55, "spread": 0.10,
+            "bestBid": 0.52, "bestAsk": 0.58, "liquidity": 10_000.0,
+        }])
+        open_pos = _open_positions_df(db)
+        mtm = paper_trader.mark_to_market(open_pos, mkt)
+
+        # bid direto (0.52), não yes_price - spread/2 = 0.55-0.05 = 0.50
+        assert mtm.iloc[0]["current_price"] == pytest.approx(0.52)
+
+    def test_buy_no_usa_1_menos_ask_nao_yes_price(self, tmp_path, monkeypatch):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = self._seed_db(tmp_path, direction="BUY_NO")
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+
+        mkt = pd.DataFrame([{
+            "conditionId": "0xbbb", "yes_price": 0.55, "spread": 0.10,
+            "bestBid": 0.52, "bestAsk": 0.58, "liquidity": 10_000.0,
+        }])
+        open_pos = _open_positions_df(db)
+        mtm = paper_trader.mark_to_market(open_pos, mkt)
+
+        # 1 - ask (1-0.58=0.42), não (1-yes_price) - spread/2 = 0.45-0.05 = 0.40
+        assert mtm.iloc[0]["current_price"] == pytest.approx(0.42)
+
+    def test_sem_bestbid_bestask_cai_pro_fallback_legado(self, tmp_path, monkeypatch):
+        sys.path.insert(0, str(ROOT / "execution"))
+        import paper_trader
+        db = self._seed_db(tmp_path, direction="BUY_YES")
+        monkeypatch.setattr(paper_trader, "DB_PATH", db)
+
+        mkt = pd.DataFrame([{
+            "conditionId": "0xbbb", "yes_price": 0.55, "spread": 0.10, "liquidity": 10_000.0,
+        }])
+        open_pos = _open_positions_df(db)
+        mtm = paper_trader.mark_to_market(open_pos, mkt)
+
+        assert mtm.iloc[0]["current_price"] == pytest.approx(0.50)  # 0.55 - 0.10/2
+
+
+class TestMtmOpenValueUsaBookReal:
+    """Mesma correção de TestMarkToMarketUsaBookReal, agora em backtest._mtm_open_value."""
+
+    def test_buy_no_usa_1_menos_ask(self, tmp_path, monkeypatch):
+        sys.path.insert(0, str(ROOT / "backtest"))
+        import backtest as bt
+
+        raw_dir = tmp_path / "data" / "raw" / "markets"
+        raw_dir.mkdir(parents=True)
+        mkt = pd.DataFrame([{
+            "conditionId": "0xccc", "yes_price": 0.55, "spread": 0.10,
+            "bestBid": 0.52, "bestAsk": 0.58,
+        }])
+        mkt.to_parquet(raw_dir / "markets_all_20260101_000000.parquet")
+
+        monkeypatch.chdir(tmp_path)
+        open_pos = pd.DataFrame([{
+            "condition_id": "0xccc", "direction": "BUY_NO",
+            "entry_price": 0.50, "shares": 100.0,
+        }])
+        value = bt._mtm_open_value(open_pos)
+        assert value == pytest.approx(0.42 * 100.0, abs=0.01)
+
+    def test_escolhe_por_mtime_nao_por_nome(self, tmp_path, monkeypatch):
+        sys.path.insert(0, str(ROOT / "backtest"))
+        import backtest as bt
+
+        raw_dir = tmp_path / "data" / "raw" / "markets"
+        raw_dir.mkdir(parents=True)
+        old = pd.DataFrame([{"conditionId": "0xccc", "yes_price": 0.10, "spread": 0.01,
+                              "bestBid": None, "bestAsk": None}])
+        new = pd.DataFrame([{"conditionId": "0xccc", "yes_price": 0.90, "spread": 0.01,
+                              "bestBid": None, "bestAsk": None}])
+        now = time.time()
+        old_path = raw_dir / "markets_all_99999999_999999.parquet"
+        new_path = raw_dir / "markets_all_00000000_000000.parquet"
+        old.to_parquet(old_path)
+        new.to_parquet(new_path)
+        os.utime(old_path, (now - 3600, now - 3600))
+        os.utime(new_path, (now, now))
+
+        monkeypatch.chdir(tmp_path)
+        open_pos = pd.DataFrame([{
+            "condition_id": "0xccc", "direction": "BUY_YES",
+            "entry_price": 0.50, "shares": 100.0,
+        }])
+        value = bt._mtm_open_value(open_pos)
+        # 0.90 - 0.005 (yes_price do arquivo mais NOVO por mtime, não o nome)
+        assert value == pytest.approx(0.895 * 100.0, abs=0.01)
 
 
 class TestKellyCorrelacao:

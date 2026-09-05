@@ -803,9 +803,8 @@ def mark_to_market(open_positions: pd.DataFrame, current_markets: pd.DataFrame) 
     if open_positions.empty or current_markets.empty:
         return open_positions
 
-    cols_needed = ["yes_price", "spread"]
-    if "liquidity" in current_markets.columns:
-        cols_needed.append("liquidity")
+    cols_needed = [c for c in ("yes_price", "spread", "bestBid", "bestAsk", "liquidity")
+                   if c in current_markets.columns]
 
     prices = (
         current_markets.drop_duplicates("conditionId", keep="last")
@@ -833,12 +832,28 @@ def mark_to_market(open_positions: pd.DataFrame, current_markets: pd.DataFrame) 
                 f"— usando cost basis para {pos['condition_id'][:12]}"
             )
         else:
-            yes_price = float(info.get("yes_price") or pos["entry_price"])
-            spread    = max(float(info.get("spread") or 0), 0.005)
-            if pos["direction"] == "BUY_YES":
-                current_price = max(yes_price - spread / 2, 0.001)
+            best_bid = info.get("bestBid")
+            best_ask = info.get("bestAsk")
+            if best_bid is not None and best_ask is not None \
+                    and pd.notna(best_bid) and pd.notna(best_ask):
+                # Book real disponível — mesma fórmula de
+                # risk_manager.early_exit_positions/ws_feed.evaluate_exit.
+                # Vender a mercado executa no bid; "yes_price - spread/2"
+                # (fórmula legada, ramo abaixo) descontava o spread duas vezes.
+                spread = max(float(best_ask) - float(best_bid), 0.0)
+                if pos["direction"] == "BUY_YES":
+                    current_price = max(float(best_bid), 0.001)
+                else:
+                    current_price = max(1.0 - float(best_ask), 0.001)
             else:
-                current_price = max((1.0 - yes_price) - spread / 2, 0.001)
+                # Fallback legado — snapshot sem bestBid/bestAsk (fixtures de
+                # teste, ou colunas ausentes no snapshot).
+                yes_price = float(info.get("yes_price") or pos["entry_price"])
+                spread    = max(float(info.get("spread") or 0), 0.005)
+                if pos["direction"] == "BUY_YES":
+                    current_price = max(yes_price - spread / 2, 0.001)
+                else:
+                    current_price = max((1.0 - yes_price) - spread / 2, 0.001)
 
         current_value  = current_price * float(pos["shares"])
         unrealized_pnl = current_value - float(pos["cost_usdc"])

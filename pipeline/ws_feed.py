@@ -129,7 +129,13 @@ def init_db() -> None:
 def build_asset_map() -> dict[str, AssetInfo]:
     """Constrói asset_id → AssetInfo para posições abertas e top mercados."""
     try:
-        files = sorted((ROOT / "data/raw/markets").glob("markets_all_*.parquet"), reverse=True)
+        raw_dir = ROOT / "data/raw/markets"
+        files = sorted(
+            list(raw_dir.glob("markets_all_*.parquet")) +
+            list(raw_dir.glob("markets_incremental_*.parquet")),
+            key=lambda p: p.stat().st_mtime,  # ordena por mtime, não por nome (P0-2)
+            reverse=True,
+        )
         if not files:
             logger.warning("Sem arquivos de mercado. Execute fetch_markets.py.")
             return {}

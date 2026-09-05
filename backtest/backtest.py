@@ -339,27 +339,47 @@ def _mtm_open_value(open_: pd.DataFrame) -> float | None:
     """
     if open_.empty:
         return 0.0
-    parquets = sorted(Path("data/raw/markets").glob("markets_all_*.parquet"))
+    raw_dir = Path("data/raw/markets")
+    parquets = sorted(
+        list(raw_dir.glob("markets_all_*.parquet")) +
+        list(raw_dir.glob("markets_incremental_*.parquet")),
+        key=lambda p: p.stat().st_mtime,  # ordena por mtime, não por nome (P0-2)
+        reverse=True,
+    )
     if not parquets:
         return None
     try:
-        mkts = pd.read_parquet(parquets[-1], columns=["conditionId", "yes_price", "spread"])
+        cols = ["conditionId", "yes_price", "spread", "bestBid", "bestAsk"]
+        mkts = pd.read_parquet(parquets[0], columns=cols)
     except Exception:
         return None
     prices = (
         mkts.drop_duplicates("conditionId", keep="last")
-        .set_index("conditionId")[["yes_price", "spread"]]
+        .set_index("conditionId")[["yes_price", "spread", "bestBid", "bestAsk"]]
         .to_dict(orient="index")
     )
     total = 0.0
     for _, pos in open_.iterrows():
-        info   = prices.get(pos["condition_id"], {})
-        yes    = float(info.get("yes_price") or pos["entry_price"])
-        spread = max(float(info.get("spread") or 0), 0.005)
-        if pos["direction"] == "BUY_YES":
-            px = max(yes - spread / 2, 0.001)
+        info     = prices.get(pos["condition_id"], {})
+        best_bid = info.get("bestBid")
+        best_ask = info.get("bestAsk")
+        if best_bid is not None and best_ask is not None \
+                and pd.notna(best_bid) and pd.notna(best_ask):
+            # Book real — mesma fórmula de
+            # risk_manager.early_exit_positions/ws_feed.evaluate_exit. Vender a
+            # mercado executa no bid; "yes - spread/2" (ramo abaixo) descontava
+            # o spread duas vezes.
+            if pos["direction"] == "BUY_YES":
+                px = max(float(best_bid), 0.001)
+            else:
+                px = max(1.0 - float(best_ask), 0.001)
         else:
-            px = max((1.0 - yes) - spread / 2, 0.001)
+            yes    = float(info.get("yes_price") or pos["entry_price"])
+            spread = max(float(info.get("spread") or 0), 0.005)
+            if pos["direction"] == "BUY_YES":
+                px = max(yes - spread / 2, 0.001)
+            else:
+                px = max((1.0 - yes) - spread / 2, 0.001)
         total += px * float(pos["shares"])
     return round(total, 2)
 
