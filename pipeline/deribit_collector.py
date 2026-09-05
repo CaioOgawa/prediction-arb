@@ -551,6 +551,19 @@ def run(
     now = datetime.now(timezone.utc)
     markets = load_active_markets(min_liquidity=min_liquidity)
 
+    # O snapshot mais recente por mtime pode ser um markets_all_* gravado
+    # antes do guard de coleta vazia existir (P0-6) ou, mesmo depois dele,
+    # um arquivo sem "question" por outro motivo — sem isso, a Gamma API fora
+    # do ar não vira "sem sinal deribit este ciclo", vira exceção não tratada
+    # que run_cycle.py registra como falha de etapa.
+    if markets.empty or "question" not in markets.columns:
+        logger.warning(
+            f"load_active_markets() devolveu {len(markets)} mercados sem coluna 'question' "
+            "utilizável — sem sinal deribit este ciclo (Gamma API fora do ar ou snapshot "
+            "vazio/corrompido). Verifique fetch_markets.py."
+        )
+        return pd.DataFrame()
+
     # Filtra apenas mercados de preço específico (above/below/reach $X) para BTC/ETH
     price_mask = markets["question"].str.contains(
         r"above|below|greater than|less than|exceed|over|under|reach|hit",

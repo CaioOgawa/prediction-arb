@@ -385,6 +385,41 @@ class TestParseCryptoMarketSpotDirection:
         assert parsed["direction"] == "above"
 
 
+class TestDeribitRunSemMercadosUtilizavel:
+    """
+    run() fazia markets["question"].str.contains(...) direto após
+    load_active_markets(), sem checar se veio algo utilizável. Um
+    markets_all_*.parquet gravado vazio (0 mercados, 0 colunas) antes do
+    guard de coleta vazia existir (P0-6) — ou qualquer outro snapshot sem
+    "question" — vira KeyError não tratado, que run_cycle.py registra como
+    falha de etapa em vez do "sem sinal deribit este ciclo" que devia ser.
+    Reproduzido nesta sessão: Gamma API fora do ar faz load_active_markets()
+    devolver pd.DataFrame() (0, 0) de verdade.
+    """
+
+    def test_markets_vazio_nao_lanca_keyerror(self, monkeypatch):
+        monkeypatch.setattr(deribit_collector, "load_active_markets", lambda min_liquidity=5_000: pd.DataFrame())
+        result = deribit_collector.run(save=False)
+        assert result.empty
+
+    def test_markets_sem_coluna_question_nao_lanca_keyerror(self, monkeypatch):
+        markets_sem_question = pd.DataFrame({"conditionId": ["0x1"], "volume": [10_000.0]})
+        monkeypatch.setattr(deribit_collector, "load_active_markets", lambda min_liquidity=5_000: markets_sem_question)
+        result = deribit_collector.run(save=False)
+        assert result.empty
+
+    def test_markets_com_question_segue_fluxo_normal(self, monkeypatch):
+        # Confirma que o guard não intercepta o caso são — só o vazio/sem coluna.
+        markets_ok = pd.DataFrame({
+            "conditionId": ["0x1"], "question": ["Sem match crypto aqui"],
+            "volume": [10_000.0], "liquidity": [10_000.0], "endDate": ["2026-12-31T00:00:00Z"],
+            "yes_price": [0.5],
+        })
+        monkeypatch.setattr(deribit_collector, "load_active_markets", lambda min_liquidity=5_000: markets_ok)
+        result = deribit_collector.run(save=False)
+        assert result.empty  # não é crypto — filtrado depois do guard, não por ele
+
+
 # ──────────────────────────────────────────────────────────
 # deribit_collector — bs_prob (P0-1: barreira saturava em 1.0 para todo touch upward)
 # ──────────────────────────────────────────────────────────
