@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.caio.polymarket-cycle-full</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>/Users/caio/.local/bin/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>/Users/caio/faculdade/projects/polymarket/run_cycle.py</string>
+        <string>--full</string>
+        <string>--html-report</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/caio/faculdade/projects/polymarket</string>
+
+    <!-- A cada 4 horas (14400 segundos) -->
+    <key>StartInterval</key>
+    <integer>14400</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/caio/faculdade/projects/polymarket/logs/cycle_full.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/caio/faculdade/projects/polymarket/logs/cycle_full_error.log</string>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/caio</string>
+        <key>PATH</key>
+        <string>/Users/caio/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

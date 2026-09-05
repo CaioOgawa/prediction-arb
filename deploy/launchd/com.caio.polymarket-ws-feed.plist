@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.caio.polymarket-ws-feed</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/caio/.local/bin/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>/Users/caio/faculdade/projects/polymarket/pipeline/ws_feed.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/caio/faculdade/projects/polymarket</string>
+
+    <!-- Daemon persistente — KeepAlive reinicia automaticamente se cair -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/caio/faculdade/projects/polymarket/logs/ws_feed.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/caio/faculdade/projects/polymarket/logs/ws_feed_error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/caio</string>
+        <key>PATH</key>
+        <string>/Users/caio/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
