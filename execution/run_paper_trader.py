@@ -48,6 +48,10 @@ console = Console()
               help="Simula sem salvar posições no banco.")
 @click.option("--status",         is_flag=True, default=False,
               help="Apenas exibe o portfólio atual, sem abrir novas posições.")
+@click.option("--new-epoch",      default=None, type=str,
+              help="Marca início de um novo epoch de MEDIÇÃO (Fase 3) com esta nota e sai — "
+                   "não mexe em portfólio/posições, só afeta o que backtest/dashboard contam "
+                   "como amostra a partir de agora.")
 def main(
     mode: str,
     capital: float,
@@ -57,6 +61,7 @@ def main(
     top_signals: int | None,
     dry_run: bool,
     status: bool,
+    new_epoch: str | None,
 ) -> None:
     """Paper trader com sinais reais (odds + deribit) e Kelly × confidence sizing."""
     logger.remove()
@@ -67,8 +72,14 @@ def main(
     from execution.paper_trader import (
         init_db, get_or_create_portfolio, get_open_positions,
         load_current_markets, mark_to_market, print_portfolio,
-        run_paper_trading,
+        run_paper_trading, start_new_epoch,
     )
+
+    if new_epoch is not None:
+        init_db()
+        epoch = start_new_epoch(new_epoch)
+        console.print(f"[green]Novo epoch de medição iniciado:[/green] {epoch['started_at']} — {new_epoch}")
+        return
 
     if status:
         init_db()

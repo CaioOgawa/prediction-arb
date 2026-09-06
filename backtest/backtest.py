@@ -66,17 +66,29 @@ def load_positions(db_path: Path = DB_PATH) -> tuple[pd.DataFrame, pd.DataFrame]
     Retorna (closed_df, open_df) a partir do SQLite.
     Adiciona colunas `signal_source` e `confidence` se a tabela antiga não tiver.
 
-    Escopo: apenas posições abertas a partir do portfólio ATUAL (última linha da
-    tabela portfolio). Um reset de portfólio zera as métricas — sem isso, os 47
-    trades corrompidos do incidente 2026-05 poluiriam o win rate para sempre.
+    Escopo: só posições abertas a partir do boundary de medição atual. Fase 3
+    (2026-09-06): se existe um epoch em `portfolio_epochs` (marca "a amostra
+    limpa começa aqui" sem resetar o portfólio — resetar de verdade com
+    posições abertas quebraria a dedupe de get_traded_condition_ids()), usa
+    o mais recente; senão cai no comportamento de sempre (created_at do
+    portfólio ATUAL). Sem isso, os 47 trades corrompidos do incidente 2026-05
+    poluiriam o win rate para sempre.
     """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    portfolio_start = conn.execute(
-        "SELECT created_at FROM portfolio ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    since = portfolio_start["created_at"] if portfolio_start else "1970-01-01"
+    tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    epoch = (
+        conn.execute("SELECT started_at FROM portfolio_epochs ORDER BY id DESC LIMIT 1").fetchone()
+        if "portfolio_epochs" in tables else None
+    )
+    if epoch:
+        since = epoch["started_at"]
+    else:
+        portfolio_start = conn.execute(
+            "SELECT created_at FROM portfolio ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        since = portfolio_start["created_at"] if portfolio_start else "1970-01-01"
 
     pragma = {r["name"] for r in conn.execute("PRAGMA table_info(positions)")}
 

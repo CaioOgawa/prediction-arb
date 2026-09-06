@@ -49,6 +49,19 @@ CREATE TABLE IF NOT EXISTS portfolio (
     note            TEXT
 );
 
+-- Fase 3: boundary de MEDIÇÃO (backtest/calibração), independente do
+-- portfólio. Nunca lido pelo caminho de trading ao vivo (get_traded_
+-- condition_ids, get_open_positions, check_exposure, open_position) — só
+-- por consumidores de relatório (backtest.py, dashboard/app.py). Existe
+-- pra permitir marcar "a amostra limpa começa aqui" sem resetar o
+-- portfólio, o que quebraria a dedupe de get_traded_condition_ids() se
+-- houver posições abertas na hora do corte.
+CREATE TABLE IF NOT EXISTS portfolio_epochs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    note            TEXT
+);
+
 CREATE TABLE IF NOT EXISTS positions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     opened_at       TEXT    NOT NULL DEFAULT (datetime('now')),
@@ -145,6 +158,26 @@ def get_or_create_portfolio(initial_capital: float = 1_000.0) -> dict:
             "initial_capital": initial_capital,
             "current_cash":    initial_capital,
         }
+
+
+def start_new_epoch(note: str = "") -> dict:
+    """
+    Marca o início de um novo epoch de MEDIÇÃO (Fase 3 — backtest/calibração).
+    Só afeta relatório: não mexe em portfolio/positions, não passa perto de
+    get_traded_condition_ids()/get_open_positions()/check_exposure()/
+    open_position() — nenhuma decisão de trading ao vivo lê esta tabela.
+
+    Existe pra separar "quando o dinheiro/dedupe ao vivo reseta" (portfolio,
+    intocado) de "a partir de quando a amostra conta pra medir se o edge é
+    real" (portfolio_epochs) — resetar o portfolio de verdade com posições
+    abertas quebraria get_traded_condition_ids() (filtra por
+    portfolio.created_at, único guard contra reabrir o mesmo mercado).
+    """
+    with contextlib.closing(get_connection()) as conn:
+        conn.execute("INSERT INTO portfolio_epochs (note) VALUES (?)", (note,))
+        conn.commit()
+        row = conn.execute("SELECT * FROM portfolio_epochs ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row)
 
 
 def get_open_positions() -> pd.DataFrame:

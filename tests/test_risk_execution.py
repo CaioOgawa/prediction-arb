@@ -2558,6 +2558,75 @@ class TestExecuteCycle:
         assert n_positions == 0
 
 
+class TestPortfolioEpoch:
+    """Fase 3 (2026-09-06): portfolio_epochs marca "a amostra de medição
+    limpa começa aqui" sem resetar o portfólio — resetar de verdade com
+    posições abertas quebraria get_traded_condition_ids() (único guard
+    contra reabrir o mesmo mercado de uma posição já aberta, filtra por
+    portfolio.created_at). Estes testes travam as duas garantias: o epoch
+    afeta load_positions() do backtest (métrica), e NÃO afeta o caminho de
+    trading ao vivo."""
+
+    def _insert_position(self, db, condition_id, opened_at, status="closed", pnl=1.0):
+        conn = sqlite3.connect(db)
+        conn.execute("""
+            INSERT INTO positions
+              (condition_id, question, direction, entry_price, shares, cost_usdc,
+               status, pnl_usdc, opened_at, closed_at)
+            VALUES (?, 'Teste?', 'BUY_YES', 0.5, 10, 5, ?, ?, ?, ?)
+        """, (condition_id, status, pnl, opened_at, opened_at if status == "closed" else None))
+        conn.commit()
+        conn.close()
+
+    def test_start_new_epoch_grava_e_le(self, execute_cycle_db):
+        epoch = paper_trader.start_new_epoch("pós-audit de teste")
+        assert epoch["note"] == "pós-audit de teste"
+        conn = sqlite3.connect(execute_cycle_db)
+        row = conn.execute("SELECT note FROM portfolio_epochs ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        assert row[0] == "pós-audit de teste"
+
+    def test_load_positions_usa_epoch_quando_existe(self, execute_cycle_db):
+        self._insert_position(execute_cycle_db, "0xantes", "2026-01-01 00:00:00")
+        paper_trader.start_new_epoch("corte de teste")
+        # SQLite datetime('now') é UTC — "agora" em UTC cai depois do
+        # started_at do epoch (criado um instante atrás), então esta posição
+        # entra na amostra pós-corte.
+        depois = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self._insert_position(execute_cycle_db, "0xdepois", depois)
+
+        closed, _open = live_backtest.load_positions(execute_cycle_db)
+
+        assert list(closed["condition_id"]) == ["0xdepois"]
+
+    def test_sem_epoch_usa_created_at_do_portfolio_como_sempre(self, execute_cycle_db):
+        # Sem nenhum epoch criado: comportamento de hoje, intocado — filtra
+        # por portfolio.created_at (fixture insere o portfólio com created_at
+        # padrão = agora, então uma posição "de 2026-01-01" fica de fora).
+        self._insert_position(execute_cycle_db, "0xvelha", "2026-01-01 00:00:00")
+
+        closed, _open = live_backtest.load_positions(execute_cycle_db)
+
+        assert "0xvelha" not in list(closed["condition_id"])
+
+    def test_epoch_nao_afeta_dedupe_do_trading_ao_vivo(self, execute_cycle_db):
+        # Regressão: get_traded_condition_ids() PRECISA continuar enxergando
+        # posições abertas antes do epoch — é o único guard contra reabrir o
+        # mesmo mercado (open_position() rejeita se cid in traded). A posição
+        # precisa ser posterior ao created_at do portfólio (é o filtro que
+        # get_traded_condition_ids() de fato usa, intocado por este fix) —
+        # "agora" serve, o fixture cria o portfólio com created_at=agora.
+        # SQLite datetime('now') é UTC — usa timezone.utc aqui pra não ficar
+        # atrás por causa do fuso local.
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self._insert_position(execute_cycle_db, "0xaberta-antes", now, status="open")
+        paper_trader.start_new_epoch("corte de teste")
+
+        traded = paper_trader.get_traded_condition_ids()
+
+        assert "0xaberta-antes" in traded
+
+
 class TestRunPaperTraderCliNaoDuplicaConstanteDoRiskManager:
     """
     R2: --min-liquidity e --top-signals tinham default literal (5_000.0/30)
