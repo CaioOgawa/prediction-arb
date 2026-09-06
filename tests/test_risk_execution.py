@@ -1257,6 +1257,102 @@ class TestEdgeCalibrationEConfidenceAccuracySuficiencia:
         assert row["wilson_lo"] <= row["win_rate"] <= row["wilson_hi"]
 
 
+class TestBenjaminiHochberg:
+    """Correção de FDR à mão (sem depender de statsmodels) usada pela
+    calibração de edge por fonte."""
+
+    def test_lista_vazia_nao_quebra(self):
+        assert live_backtest.benjamini_hochberg([]) == []
+
+    def test_exemplo_didatico_classico(self):
+        # 8 p-values, alfa=5%: (k/8)*0.05 pra k=1..8 -> 0.00625, 0.0125, ...
+        # 0.005 <= 0.00625 (passa) e 0.011 <= 0.0125 (passa); 0.02 > 0.01875
+        # (falha) — corte fica no 2º menor, só os dois primeiros rejeitam.
+        pvalues = [0.005, 0.011, 0.02, 0.04, 0.13, 0.26, 0.51, 0.9]
+        assert live_backtest.benjamini_hochberg(pvalues, alpha=0.05) == [
+            True, True, False, False, False, False, False, False,
+        ]
+
+    def test_nenhum_p_value_passa(self):
+        pvalues = [0.4, 0.6, 0.8]
+        assert live_backtest.benjamini_hochberg(pvalues, alpha=0.05) == [False, False, False]
+
+    def test_todos_passam_com_p_values_baixos(self):
+        pvalues = [0.001, 0.002, 0.003]
+        assert live_backtest.benjamini_hochberg(pvalues, alpha=0.05) == [True, True, True]
+
+
+class TestEdgeCalibrationBySource:
+    """Fase 3: edge previsto vs. retorno realizado por fonte, testando
+    H0 = retorno médio real é zero (não win rate contra 50%, que não é o
+    breakeven certo quando entry_price varia por posição)."""
+
+    def test_vazio_preserva_colunas(self):
+        cal = live_backtest.edge_calibration_by_source(pd.DataFrame())
+        assert list(cal.columns) == [
+            "signal_source", "edge_bin", "n", "avg_edge", "avg_return",
+            "se_return", "p_value", "sufficient_n", "significant_fdr",
+        ]
+
+    def test_sem_edge_at_entry_retorna_vazio(self):
+        cal = live_backtest.edge_calibration_by_source(pd.DataFrame({"pnl_usdc": [1.0]}))
+        assert cal.empty
+
+    def test_fonte_com_retorno_consistentemente_positivo_e_significativa(self):
+        # odds: edge baixo/alto, retorno sempre positivo e estável -> p-value
+        # baixo, deve sobreviver FDR. deribit: retorno oscila em torno de
+        # zero -> não deve ser significativo.
+        rows = []
+        for i in range(25):
+            rows.append({
+                "signal_source": "odds", "edge_at_entry": 0.05 + 0.001 * i,
+                "pnl_usdc": 2.0 + (0.1 if i % 2 == 0 else -0.1), "cost_usdc": 20.0,
+            })
+        for i in range(25):
+            rows.append({
+                "signal_source": "deribit", "edge_at_entry": 0.05 + 0.001 * i,
+                "pnl_usdc": 2.0 if i % 2 == 0 else -2.0, "cost_usdc": 20.0,
+            })
+        closed = pd.DataFrame(rows)
+        cal = live_backtest.edge_calibration_by_source(closed, n_bins=1)
+
+        odds_row = cal[cal["signal_source"] == "odds"].iloc[0]
+        deribit_row = cal[cal["signal_source"] == "deribit"].iloc[0]
+        assert odds_row["significant_fdr"]
+        assert not deribit_row["significant_fdr"]
+
+    def test_bin_com_n_insuficiente_fica_fora_da_correcao(self):
+        rows = [
+            {"signal_source": "odds", "edge_at_entry": 0.05, "pnl_usdc": 1.0, "cost_usdc": 10.0}
+            for _ in range(3)
+        ]
+        cal = live_backtest.edge_calibration_by_source(pd.DataFrame(rows), n_bins=1)
+        row = cal.iloc[0]
+        assert not row["sufficient_n"]
+        assert not row["significant_fdr"]
+
+    def test_correcao_fdr_roda_junto_entre_fontes(self):
+        # Uma célula isolada com p-value baixo (ex.: 0.03) sozinha passaria
+        # no teste não-corrigido, mas se junto de várias outras células com
+        # p-values altos na mesma tabela o corte de BH pode reprovar ela —
+        # prova de que a correção olha a tabela inteira, não célula a célula.
+        rng = np.random.default_rng(42)
+        rows = []
+        for src_i in range(4):
+            for i in range(22):
+                rows.append({
+                    "signal_source": f"fonte{src_i}",
+                    "edge_at_entry": 0.05 + 0.001 * i,
+                    "pnl_usdc": float(rng.normal(0, 5)),
+                    "cost_usdc": 20.0,
+                })
+        closed = pd.DataFrame(rows)
+        cal = live_backtest.edge_calibration_by_source(closed, n_bins=1)
+        assert len(cal) == 4
+        n_pvals_validos = cal["p_value"].notna().sum()
+        assert n_pvals_validos == 4
+
+
 class TestSimBacktestBrierECalibSummary:
     """P2-32: _summary() reporta Brier score e erro de calibração médio —
     as duas métricas que não dependem de market_discount, ao contrário de

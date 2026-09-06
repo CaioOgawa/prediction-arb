@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from loguru import logger
+from scipy import stats as scipy_stats
 
 DB_PATH     = Path("data/db/paper_trading.db")
 RESULTS_DIR = Path("backtest/results")
@@ -55,6 +56,30 @@ def wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
     lo = (center - margin) / denom
     hi = (center + margin) / denom
     return (max(0.0, lo), min(1.0, hi))
+
+
+def benjamini_hochberg(pvalues: list[float], alpha: float = 0.05) -> list[bool]:
+    """
+    Correção de Benjamini-Hochberg (controle de FDR), implementada à mão pra
+    não puxar statsmodels como dependência nova só por isso.
+
+    Recebe p-values de UMA família de testes (não misturar perguntas
+    diferentes numa chamada só — cada tabela que compara grupos/bins é sua
+    própria família) e devolve, na mesma ordem, quais rejeitam H0 sob a
+    correção: ordena por p-value, acha o maior k onde o k-ésimo menor
+    p-value ainda é <= (k/m)*alpha, e rejeita todo mundo até esse corte.
+    """
+    m = len(pvalues)
+    if m == 0:
+        return []
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    sorted_pvals = [pvalues[i] for i in order]
+    passing = [p <= (k + 1) / m * alpha for k, p in enumerate(sorted_pvals)]
+    cutoff_idx = max((k for k, ok in enumerate(passing) if ok), default=-1)
+    if cutoff_idx < 0:
+        return [False] * m
+    cutoff_p = sorted_pvals[cutoff_idx]
+    return [p <= cutoff_p for p in pvalues]
 
 
 # ──────────────────────────────────────────────────────────
@@ -255,6 +280,79 @@ def edge_calibration(closed: pd.DataFrame, n_bins: int = 5) -> pd.DataFrame:
     cal["edge_bin"] = cal["edge_bin"].astype(str)
     cal["sufficient_n"] = cal["n"] >= MIN_N_FOR_WIN_RATE
     return cal
+
+
+def edge_calibration_by_source(closed: pd.DataFrame, n_bins: int = 5) -> pd.DataFrame:
+    """
+    Calibração de edge por fonte de sinal: dentro de cada `signal_source`,
+    agrupa `edge_at_entry` em bins e testa H0 = retorno médio real
+    (pnl_usdc/cost_usdc) é zero em cada bin (teste t de uma amostra),
+    corrigindo os p-values com Benjamini-Hochberg dentro desta tabela.
+
+    Por que não win rate/Wilson aqui: win rate contra 50% não é o breakeven
+    certo quando `entry_price` varia por posição — um BUY_YES entrado a
+    0.82 que acerta 70% das vezes é prejuízo, não sinal. Wilson continua
+    sendo a métrica certa pra `win_rate_by_source`/`confidence_accuracy`
+    (onde ganhar/perder já É a pergunta); aqui a pergunta é se o edge
+    previsto bate com o retorno realizado, e retorno médio contra zero
+    testa isso direto sem precisar modelar o preço de entrada.
+
+    Cada fonte tem sua própria família de bins (edges de fontes diferentes
+    não são comparáveis na mesma escala), mas a correção de FDR roda sobre
+    TODAS as células da tabela junto — é uma família de testes só (a
+    pergunta "o edge é real" repetida por bin/fonte), diferente das outras
+    tabelas do relatório, que ficam de fora dessa correção por testarem
+    perguntas diferentes.
+    """
+    cols = ["signal_source", "edge_bin", "n", "avg_edge", "avg_return",
+            "se_return", "p_value", "sufficient_n", "significant_fdr"]
+    if closed.empty or "edge_at_entry" not in closed.columns:
+        return pd.DataFrame(columns=cols)
+
+    df = closed[closed["edge_at_entry"].notna() & (closed["cost_usdc"] > 0)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df["realized_return"] = df["pnl_usdc"] / df["cost_usdc"]
+
+    rows = []
+    for source, g in df.groupby("signal_source"):
+        g = g.copy()
+        try:
+            g["edge_bin"] = pd.cut(g["edge_at_entry"], bins=min(n_bins, g["edge_at_entry"].nunique()))
+        except ValueError:
+            continue
+        for edge_bin, gb in g.groupby("edge_bin", observed=True):
+            n = len(gb)
+            if n == 0:
+                continue
+            returns = gb["realized_return"].to_numpy()
+            avg_return = float(returns.mean())
+            se_return = float(returns.std(ddof=1) / np.sqrt(n)) if n > 1 else float("nan")
+            p_value = float("nan")
+            if n > 1 and not np.isclose(returns.std(ddof=1), 0.0):
+                p_value = float(scipy_stats.ttest_1samp(returns, 0.0).pvalue)
+            rows.append({
+                "signal_source": source,
+                "edge_bin": str(edge_bin),
+                "n": n,
+                "avg_edge": float(gb["edge_at_entry"].mean()),
+                "avg_return": avg_return,
+                "se_return": se_return,
+                "p_value": p_value,
+                "sufficient_n": n >= MIN_N_FOR_WIN_RATE,
+            })
+
+    result = pd.DataFrame(rows, columns=cols[:-1])
+    result["significant_fdr"] = False
+    if result.empty:
+        return result
+
+    testable = result["sufficient_n"] & result["p_value"].notna()
+    if testable.any():
+        pvals = result.loc[testable, "p_value"].tolist()
+        result.loc[testable, "significant_fdr"] = benjamini_hochberg(pvals, alpha=0.05)
+    return result
 
 
 def confidence_accuracy(closed: pd.DataFrame, n_bins: int = 4) -> pd.DataFrame:
@@ -509,6 +607,7 @@ def generate_html_report(
     wr_src   = win_rate_by_source(closed)
     wr_tt    = win_rate_by_trade_type(closed)
     edge_cal = edge_calibration(closed)
+    cal_src  = edge_calibration_by_source(closed)
     conf_acc = confidence_accuracy(closed)
     curve    = pnl_curve(closed)
 
@@ -633,10 +732,20 @@ def generate_html_report(
     }
     wr_table = _df_to_html_table(wr_src_disp, fmt=wr_fmt)
     n_comparisons_html = len(wr_src) + len(wr_tt)
-    if not edge_cal.empty:
-        n_comparisons_html += int((edge_cal["n"] > 0).sum())
     if not conf_acc.empty:
         n_comparisons_html += int((conf_acc["n"] > 0).sum())
+
+    cal_src_fmt = {
+        "avg_edge":        lambda v: f"{v:.3f}",
+        "avg_return":      lambda v: f"{v:.3f}",
+        "se_return":       lambda v: f"{v:.3f}" if v == v else "—",
+        "p_value":         lambda v: f"{v:.3f}" if v == v else "—",
+        "sufficient_n":    lambda v: "✓" if v else '<span style="color:#ffd93d">⚠</span>',
+        "significant_fdr": lambda v: '<span style="color:#00d4aa">✓</span>' if v else "—",
+    }
+    cal_src_table = _df_to_html_table(cal_src, fmt=cal_src_fmt)
+    n_testable_src = int((cal_src["sufficient_n"] & cal_src["p_value"].notna()).sum()) if not cal_src.empty else 0
+    n_sig_src = int(cal_src["significant_fdr"].sum()) if not cal_src.empty else 0
 
     # ── Stats cards ────────────────────────────────────────
     def card(label: str, value: str, color: str = "#e9ecef") -> str:
@@ -709,9 +818,17 @@ def generate_html_report(
   {_df_to_html_table(wr_tt_disp, fmt=wr_fmt)}
 
   <p class="warn">
-    ⚠ P2-36: {n_comparisons_html} grupos/bins comparados nesta página, sem correção de
+    ⚠ {n_comparisons_html} grupos/bins comparados nesta página, sem correção de
     múltiplos testes — leia qualquer efeito isolado como exploratório. Linhas com
     "⚠ n&lt;20" têm intervalo de Wilson largo demais pra sustentar leitura sozinhas.
+  </p>
+
+  <h2>Calibração de Edge por Fonte</h2>
+  {cal_src_table}
+  <p class="warn">
+    {n_sig_src} de {n_testable_src} células testáveis (n≥{MIN_N_FOR_WIN_RATE}) sobrevivem
+    correção FDR (Benjamini-Hochberg, alfa=5%) — H0 por célula: retorno médio real
+    (pnl/cost) é zero. Família de teste separada das tabelas de win rate acima.
   </p>
 
   <div class="chart-section">{charts_html}</div>
@@ -851,30 +968,41 @@ def print_backtest_summary(
             )
         console.print(tbl_tt)
 
-    # Edge calibration (only if enough data)
-    cal = edge_calibration(closed)
-    if not cal.empty and cal["n"].sum() >= 5:
-        n_bins_shown = int((cal["n"] > 0).sum())
-        n_comparisons += n_bins_shown
-        console.print("[bold]── Calibração de Edge ───────────────────────────[/bold]")
+    # Calibração de edge por fonte (Fase 3): edge previsto vs. retorno
+    # realizado, quebrado por signal_source, com teste t + correção FDR.
+    cal_src = edge_calibration_by_source(closed)
+    if not cal_src.empty:
+        console.print("[bold]── Calibração de Edge por Fonte ─────────────────[/bold]")
         tbl2 = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
-        tbl2.add_column("Bin de Edge",      style="dim")
-        tbl2.add_column("N",                justify="right")
-        tbl2.add_column("Edge Previsto",    justify="right")
-        tbl2.add_column("Retorno Realizado",justify="right")
-        for _, row in cal.iterrows():
-            if row["n"] == 0:
-                continue
-            diff = row["avg_return"] - row["avg_edge"]
-            diff_color = "green" if diff >= 0 else "red"
+        tbl2.add_column("Fonte",             style="cyan")
+        tbl2.add_column("Bin de Edge",       style="dim")
+        tbl2.add_column("N",                 justify="right")
+        tbl2.add_column("Edge Previsto",     justify="right")
+        tbl2.add_column("Retorno Realizado", justify="right")
+        tbl2.add_column("p-valor",           justify="right")
+        tbl2.add_column("FDR 5%",            justify="center")
+        for _, row in cal_src.iterrows():
+            diff_color = "green" if row["avg_return"] >= row["avg_edge"] else "red"
             n_str = str(int(row["n"])) if row["sufficient_n"] else f"[dim]{int(row['n'])} ⚠[/dim]"
+            p_str = f"{row['p_value']:.3f}" if row["p_value"] == row["p_value"] else "—"
+            sig_str = "[green]✓[/green]" if row["significant_fdr"] else "—"
             tbl2.add_row(
+                str(row["signal_source"]),
                 str(row["edge_bin"]),
                 n_str,
                 f"{row['avg_edge']:.3f}",
                 f"[{diff_color}]{row['avg_return']:.3f}[/{diff_color}]",
+                p_str,
+                sig_str,
             )
         console.print(tbl2)
+        n_testable = int((cal_src["sufficient_n"] & cal_src["p_value"].notna()).sum())
+        n_sig = int(cal_src["significant_fdr"].sum())
+        console.print(
+            f"[dim]{n_sig} de {n_testable} células testáveis (n≥{MIN_N_FOR_WIN_RATE}) sobrevivem "
+            "correção FDR (Benjamini-Hochberg, alfa=5%) — H0 por célula: retorno médio real "
+            "(pnl/cost) é zero. Células com n menor aparecem só de referência, fora do teste.[/dim]"
+        )
     elif closed.empty:
         console.print("\n[dim]Aguardando posições fechadas para métricas detalhadas.[/dim]")
 
@@ -884,7 +1012,8 @@ def print_backtest_summary(
 
     if n_comparisons > 0:
         console.print(
-            f"\n[dim]P2-36: {n_comparisons} grupos/bins comparados nesta rodada, sem correção "
-            "de múltiplos testes — trate qualquer efeito isolado como exploratório, não "
-            "confirmatório. Linhas com ⚠ n<20 têm IC de Wilson largo demais pra sustentar leitura.[/dim]"
+            f"\n[dim]{n_comparisons} grupos/bins (win rate por fonte/trade type, confidence) "
+            "comparados nesta rodada sem correção de múltiplos testes — trate qualquer efeito "
+            "isolado como exploratório, não confirmatório. Linhas com ⚠ n<20 têm IC de Wilson "
+            "largo demais pra sustentar leitura.[/dim]"
         )
