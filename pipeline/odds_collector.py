@@ -79,6 +79,15 @@ CATEGORY_TO_SPORTS: dict[str, list[str]] = {
     "ucl":     ["soccer_uefa_champs_league"],      # UCL partidas (cat. Polymarket: "ucl")
     "bundesliga": ["soccer_germany_bundesliga"],
 
+    # 2026-09-06: a Gamma API parou de expor o campo `category` de
+    # /markets/keyset — gamma_collector.py agora deriva categoria das tags
+    # reais de /events?slug=..., que usam slugs diferentes dos códigos
+    # antigos pra estas duas ligas (confirmado com mercados ativos reais).
+    # Mantidas as chaves antigas acima por segurança, caso a API volte a
+    # expor os códigos curtos.
+    "la-liga":  ["soccer_spain_la_liga"],
+    "ligue-1":  ["soccer_france_ligue_one"],
+
     # Soccer genérico — fallback para categorias "soccer" não mapeadas acima.
     # Inclui apenas EPL + Bundesliga para não explodir quota da API.
     # Liga específica (lal, fl1, ucl) já são cobertas pelos mapeamentos acima.
@@ -111,6 +120,11 @@ OUTRIGHT_CATEGORY_TO_SPORTS: dict[str, str] = {
     "lal":        "soccer_spain_la_liga",
     "fl1":        "soccer_france_ligue_one",
     "bundesliga": "soccer_germany_bundesliga",
+
+    # 2026-09-06: tags reais de /events pra estas ligas hoje (ver
+    # CATEGORY_TO_SPORTS acima pro mesmo motivo).
+    "la-liga":    "soccer_spain_la_liga",
+    "ligue-1":    "soccer_france_ligue_one",
 
     # Tênis (Grand Slams) — detectado por palavra-chave na pergunta
     "tennis":     "tennis_atp_aus_open",

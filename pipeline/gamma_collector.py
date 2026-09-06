@@ -15,6 +15,7 @@ import pandas as pd
 from loguru import logger
 
 from pipeline.db import init_db, get_connection
+from pipeline.odds_collector import CATEGORY_TO_SPORTS, OUTRIGHT_CATEGORY_TO_SPORTS
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 RAW_DIR = Path("data/raw/markets")
@@ -28,6 +29,25 @@ MIN_EXPECTED_MARKETS = 300
 # derrubar a coleta inteira e virar um snapshot vazio (P0-6).
 PAGE_MAX_RETRIES  = 3
 PAGE_BACKOFF_BASE = 2.0  # segundos: 2, 4, 8
+
+# 2026-09-06: a Gamma API removeu `category` de /markets/keyset (confirmado
+# ao vivo — nenhum mercado tem mais esse campo, nem no evento aninhado). A
+# categoria real ainda existe em /events?slug=..., como tags — este é o
+# limite de slugs por request que a API aceita (acima disso responde 422).
+EVENT_TAGS_BATCH_SIZE = 100
+
+# Códigos de categoria que odds_collector.py sabe mapear pra sport_key —
+# usados pra escolher, entre as várias tags de um evento, qual vira
+# `category` (evita duplicar essa lista aqui; ver "não duplicar constantes").
+KNOWN_CATEGORY_CODES = set(CATEGORY_TO_SPORTS) | set(OUTRIGHT_CATEGORY_TO_SPORTS)
+
+# "sports"/"soccer" são fallbacks genéricos dentro de CATEGORY_TO_SPORTS (pra
+# quando a liga específica não tem mapeamento próprio) — não a categoria mais
+# informativa quando uma tag mais específica ("mlb", "nba"...) também está
+# presente. A Gamma não garante ordem por especificidade nas tags (visto ao
+# vivo: evento de MLB retorna ["Sports", "World Series", "MLB", ...], genérico
+# primeiro), então _resolve_category não pode só pegar o primeiro match.
+GENERIC_CATEGORY_CODES = {"sports", "soccer"}
 
 
 class EmptySnapshotError(Exception):
@@ -51,6 +71,68 @@ def _as_list(raw) -> list:
         return list(raw)
     except TypeError:
         return []
+
+def _fetch_event_tags(event_slugs: list[str]) -> dict[str, list[str]]:
+    """
+    Busca as tags reais de cada evento via /events?slug=... — fonte de
+    categoria desde que /markets/keyset parou de expor `category`. Batches
+    de EVENT_TAGS_BATCH_SIZE (limite confirmado ao vivo: acima disso a API
+    responde 422 "expected array length <= 100"; sem o `limit=` explícito
+    igual ao tamanho do batch, ela também trunca a resposta pro default
+    daquele endpoint, mesmo aceitando todos os slugs no filtro).
+
+    Uma falha aqui (rede, parse) NUNCA pode derrubar a coleta de mercados —
+    só loga e deixa os slugs daquele batch sem tag, o que faz a categoria
+    cair em "uncategorized" mais abaixo. Ver P0-6 em save_snapshot(): um
+    snapshot vazio por causa de uma falha em cascata já travou o pipeline
+    inteiro por 30min antes.
+    """
+    tags_by_slug: dict[str, list[str]] = {}
+    unique_slugs = list(dict.fromkeys(s for s in event_slugs if s))
+
+    for i in range(0, len(unique_slugs), EVENT_TAGS_BATCH_SIZE):
+        batch = unique_slugs[i:i + EVENT_TAGS_BATCH_SIZE]
+        params = [("slug", s) for s in batch] + [("limit", len(batch))]
+        try:
+            resp = requests.get(f"{GAMMA_BASE}/events", params=params, timeout=20)
+            resp.raise_for_status()
+            events = resp.json()
+        except (requests.RequestException, ValueError) as e:
+            logger.warning(f"Erro buscando tags de eventos (batch {i // EVENT_TAGS_BATCH_SIZE + 1}): {e}")
+            continue
+
+        if not isinstance(events, list):
+            continue
+        for ev in events:
+            slug = ev.get("slug")
+            tags = ev.get("tags") or []
+            if slug and isinstance(tags, list):
+                tags_by_slug[slug] = [
+                    t.get("slug", "").lower() for t in tags if isinstance(t, dict) and t.get("slug")
+                ]
+
+        time.sleep(0.15)
+
+    return tags_by_slug
+
+
+def _resolve_category(event_slug: str | None, tags_by_slug: dict[str, list[str]]) -> str:
+    """Escolhe a categoria de um mercado a partir das tags do seu evento:
+    prefere um código específico conhecido de odds_collector.py (bate
+    direto no filtro de esportes), depois um código genérico conhecido
+    ("sports"/"soccer"), depois a primeira tag disponível, senão
+    "uncategorized"."""
+    tags = tags_by_slug.get(event_slug) if event_slug else None
+    if not tags:
+        return "uncategorized"
+    specific = [t for t in tags if t in KNOWN_CATEGORY_CODES and t not in GENERIC_CATEGORY_CODES]
+    if specific:
+        return specific[0]
+    generic = [t for t in tags if t in GENERIC_CATEGORY_CODES]
+    if generic:
+        return generic[0]
+    return tags[0]
+
 
 # Colunas base do payload da Gamma API
 KEEP_COLS = [
@@ -232,6 +314,18 @@ def fetch_markets(
     # Filtra por volume mínimo (redundante com volume_num_min — cinto e suspensório)
     if min_volume > 0 and not df.empty:
         df = df[df["volume"] >= min_volume].reset_index(drop=True)
+
+    # 2026-09-06: categoria não vem mais direto do /markets/keyset (ver
+    # KNOWN_CATEGORY_CODES acima) — busca via /events só pras linhas que
+    # ficaram "uncategorized", preservando qualquer categoria direta que a
+    # API volte a expor no futuro sem gastar request à toa.
+    if not df.empty:
+        needs_category = df["category"] == "uncategorized"
+        if needs_category.any():
+            tags_by_slug = _fetch_event_tags(df.loc[needs_category, "event_slug"].tolist())
+            df.loc[needs_category, "category"] = df.loc[needs_category, "event_slug"].apply(
+                lambda s: _resolve_category(s, tags_by_slug)
+            )
 
     logger.info(f"Coleta concluída: {len(df)} mercados (filtro volume >= ${min_volume:,.0f})")
 

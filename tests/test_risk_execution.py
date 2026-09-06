@@ -189,6 +189,8 @@ class TestGammaKeyset:
         calls = []
 
         def fake_get(url, params=None, timeout=None):
+            if "/events" in url:
+                return _FakeResp([])  # sem tags — categoria fica "uncategorized"
             assert "/markets/keyset" in url
             calls.append(dict(params or {}))
             idx = len(calls) - 1
@@ -267,6 +269,148 @@ class TestGammaKeyset:
         df = gamma_collector.fetch_markets(min_volume=0)
         assert df.empty
         assert calls["n"] == gamma_collector.PAGE_MAX_RETRIES
+
+
+class TestResolveCategoryViaEventTags:
+    """2026-09-06: a Gamma API parou de expor `category` em /markets/keyset
+    — categoria agora vem de /events?slug=... (tags reais por evento)."""
+
+    def test_tag_conhecida_vence_sobre_tag_generica(self):
+        tags_by_slug = {"mlb-ws-2026": ["sports", "mlb", "baseball"]}
+        assert gamma_collector._resolve_category("mlb-ws-2026", tags_by_slug) == "mlb"
+
+    def test_sem_tag_conhecida_usa_a_primeira(self):
+        tags_by_slug = {"xi-jinping-out": ["geopolitics", "world", "politics"]}
+        assert gamma_collector._resolve_category("xi-jinping-out", tags_by_slug) == "geopolitics"
+
+    def test_evento_sem_tags_fica_uncategorized(self):
+        assert gamma_collector._resolve_category("algum-slug", {"algum-slug": []}) == "uncategorized"
+
+    def test_slug_ausente_do_mapa_fica_uncategorized(self):
+        assert gamma_collector._resolve_category("nao-buscado", {}) == "uncategorized"
+
+    def test_slug_none_fica_uncategorized(self):
+        assert gamma_collector._resolve_category(None, {"x": ["mlb"]}) == "uncategorized"
+
+
+class TestFetchEventTags:
+    def test_bate_em_batches_de_100_e_agrega(self, monkeypatch):
+        slugs = [f"evento-{i}" for i in range(150)]
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            assert "/events" in url
+            batch = [v for k, v in params if k == "slug"]
+            calls.append(batch)
+            return _FakeResp([
+                {"slug": s, "tags": [{"slug": "mlb"}]} for s in batch
+            ])
+
+        monkeypatch.setattr(gamma_collector.requests, "get", fake_get)
+        monkeypatch.setattr(gamma_collector.time, "sleep", lambda s: None)
+
+        result = gamma_collector._fetch_event_tags(slugs)
+        assert len(calls) == 2                    # 150 / 100 -> 2 batches
+        assert len(calls[0]) == 100 and len(calls[1]) == 50
+        assert result["evento-0"] == ["mlb"]
+        assert len(result) == 150
+
+    def test_falha_de_rede_nao_propaga_so_perde_o_batch(self, monkeypatch):
+        import requests as _requests
+
+        def fake_get(url, params=None, timeout=None):
+            raise _requests.exceptions.ConnectionError("dns falhou")
+
+        monkeypatch.setattr(gamma_collector.requests, "get", fake_get)
+        monkeypatch.setattr(gamma_collector.time, "sleep", lambda s: None)
+
+        result = gamma_collector._fetch_event_tags(["a", "b"])
+        assert result == {}
+
+    def test_slugs_vazios_ou_none_nao_geram_request(self, monkeypatch):
+        calls = {"n": 0}
+
+        def fake_get(url, params=None, timeout=None):
+            calls["n"] += 1
+            return _FakeResp([])
+
+        monkeypatch.setattr(gamma_collector.requests, "get", fake_get)
+        result = gamma_collector._fetch_event_tags([None, "", None])
+        assert result == {}
+        assert calls["n"] == 0
+
+    def test_tags_normalizadas_para_minusculo(self, monkeypatch):
+        def fake_get(url, params=None, timeout=None):
+            return _FakeResp([{"slug": "ev1", "tags": [{"slug": "MLB"}, {"slug": "Baseball"}]}])
+
+        monkeypatch.setattr(gamma_collector.requests, "get", fake_get)
+        monkeypatch.setattr(gamma_collector.time, "sleep", lambda s: None)
+
+        result = gamma_collector._fetch_event_tags(["ev1"])
+        assert result["ev1"] == ["mlb", "baseball"]
+
+
+class TestFetchMarketsEnriquecCategoria:
+    """A enriquecimento de categoria só roda pras linhas que ficaram
+    "uncategorized" — e nunca pode fazer fetch_markets() levantar mesmo se
+    /events falhar."""
+
+    def test_categoria_direta_nao_dispara_fetch_de_tags(self, monkeypatch):
+        page = {"markets": [{
+            **_mk_market(0),
+            "category": "politics",
+        }], "next_cursor": None}
+        events_calls = {"n": 0}
+
+        def fake_get(url, params=None, timeout=None):
+            if "/events" in url:
+                events_calls["n"] += 1
+                return _FakeResp([])
+            return _FakeResp(page)
+
+        monkeypatch.setattr(gamma_collector.requests, "get", fake_get)
+        monkeypatch.setattr(gamma_collector.time, "sleep", lambda s: None)
+
+        df = gamma_collector.fetch_markets(min_volume=0)
+        assert df.iloc[0]["category"] == "politics"
+        assert events_calls["n"] == 0
+
+    def test_categoria_ausente_busca_via_events_e_preenche(self, monkeypatch):
+        page = {"markets": [{
+            **_mk_market(0),
+            "events": [{"slug": "mlb-ws-2026", "title": "MLB WS"}],
+        }], "next_cursor": None}
+
+        def fake_get(url, params=None, timeout=None):
+            if "/events" in url:
+                return _FakeResp([{"slug": "mlb-ws-2026", "tags": [{"slug": "sports"}, {"slug": "mlb"}]}])
+            return _FakeResp(page)
+
+        monkeypatch.setattr(gamma_collector.requests, "get", fake_get)
+        monkeypatch.setattr(gamma_collector.time, "sleep", lambda s: None)
+
+        df = gamma_collector.fetch_markets(min_volume=0)
+        assert df.iloc[0]["category"] == "mlb"
+
+    def test_falha_no_events_nao_derruba_fetch_markets(self, monkeypatch):
+        import requests as _requests
+
+        page = {"markets": [{
+            **_mk_market(0),
+            "events": [{"slug": "mlb-ws-2026", "title": "MLB WS"}],
+        }], "next_cursor": None}
+
+        def fake_get(url, params=None, timeout=None):
+            if "/events" in url:
+                raise _requests.exceptions.ConnectionError("dns falhou")
+            return _FakeResp(page)
+
+        monkeypatch.setattr(gamma_collector.requests, "get", fake_get)
+        monkeypatch.setattr(gamma_collector.time, "sleep", lambda s: None)
+
+        df = gamma_collector.fetch_markets(min_volume=0)
+        assert len(df) == 1
+        assert df.iloc[0]["category"] == "uncategorized"
 
 
 class TestSaveSnapshotNaoEnvenena:
