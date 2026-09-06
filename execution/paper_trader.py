@@ -1067,27 +1067,41 @@ def print_portfolio(portfolio: dict, positions_mtm: pd.DataFrame) -> None:
     console.print(table)
 
 
-def run_paper_trading(
+def execute_cycle(
     initial_capital: float = 1_000.0,
     max_positions: int | None = None,
     edge_threshold: float | None = None,
     min_liquidity: float | None = None,
-    dry_run: bool = False,
     top_signals: int | None = None,
-    mode: str = "odds",
-) -> None:
+    mode: str = "all",
+    dry_run: bool = False,
+    alert_manual_resolution: bool = False,
+) -> dict:
     """
-    Ciclo completo do paper trader:
+    Núcleo do ciclo de trading, compartilhado por run_paper_trading() (30min,
+    via run_cycle.py) e run_execution.py::main() (5min, standalone) — R2 do
+    audit de 2026-09-03. Antes desta função, os dois arquivos duplicavam a
+    mesma lógica e já divergiram 3 vezes (commits bf7e85b, e3f4276).
+
       1. Resolve posições de mercados fechados (P&L real)
-      2. Verifica stop loss por drawdown
-      3. Carrega sinais reais (odds/deribit/all)
-      4. Abre novas posições via Kelly × confidence
-      5. Mark-to-market e exibe portfólio
+      2. Reclassifica pernas de arb órfãs / detecta posições travadas
+      3. Verifica saída antecipada
+      4. Verifica stop loss por drawdown (bloqueia rebalance/abertura em halt)
+      5. Rebalanceia posições existentes e abre baskets de arb pendentes
+      6. Carrega sinais reais (odds/deribit/all) e abre novas posições
+      7. Mark-to-market final
+
+    Não imprime nem loga nada — devolve um dict com tudo que os dois
+    chamadores precisam pra mostrar do jeito deles (rich console vs loguru).
+    Lock de processo e I/O específicos de cada cadência (CSV do portfólio,
+    resumo de exposição, fcntl.flock) ficam nos dois wrappers, não aqui.
+
+    alert_manual_resolution: só True no ciclo de 30min — evita spammar
+    Telegram sobre a mesma posição travada a cada 5 minutos (P1-16).
     """
     from risk.risk_manager import (
         resolve_positions, early_exit_positions, check_drawdown_stop,
-        portfolio_risk_summary, MAX_OPEN_POSITIONS,
-        MIN_SIGNAL_LIQUIDITY, MAX_SIGNALS_PER_CYCLE,
+        MAX_OPEN_POSITIONS, MIN_SIGNAL_LIQUIDITY, MAX_SIGNALS_PER_CYCLE,
         reclassify_orphan_arb_legs, find_positions_needing_manual_resolution,
     )
 
@@ -1102,26 +1116,14 @@ def run_paper_trading(
 
     init_db()
     portfolio = get_or_create_portfolio(initial_capital)
-    console.print(f"\n[bold]Paper Trader — capital: ${float(portfolio['initial_capital']):,.0f} USDC | modo: {mode.upper()}[/bold]")
-    if dry_run:
-        console.print("[yellow][DRY RUN] Nenhuma posição será salva.[/yellow]\n")
-
     current_markets = load_current_markets()
     open_pos = get_open_positions()
 
     # ── 1. Resolve posições ─────────────────────────────
+    resolved: list = []
     if not open_pos.empty and not current_markets.empty:
         resolved = resolve_positions(open_pos, current_markets, DB_PATH, dry_run=dry_run)
         if resolved:
-            console.print(f"[bold]Posições resolvidas: {len(resolved)}[/bold]")
-            for r in resolved:
-                pnl_c = "green" if r["pnl_usdc"] >= 0 else "red"
-                console.print(
-                    f"  [{pnl_c}]{r['status'].upper()}[/{pnl_c}] "
-                    f"{r['question'][:50]} | "
-                    f"[{pnl_c}]P&L=${r['pnl_usdc']:+.2f}[/{pnl_c}]"
-                )
-            # Recarrega após resolução
             open_pos  = get_open_positions()
             portfolio = get_or_create_portfolio(initial_capital)
 
@@ -1131,7 +1133,6 @@ def run_paper_trading(
     # (EARLY_EXIT["arb"] é hold-forever por design). Reclassifica para 'value'.
     orphans = reclassify_orphan_arb_legs(DB_PATH, dry_run=dry_run)
     if orphans:
-        console.print(f"[bold yellow]Pernas de arb órfãs reclassificadas: {len(orphans)}[/bold yellow]")
         try:
             from notify import alert
             groups = sorted({o["arb_group"] for o in orphans})
@@ -1149,35 +1150,28 @@ def run_paper_trading(
     # resolve_positions deixa ABERTA (não fecha com resultado fabricado)
     # qualquer posição que fechou sem outcomePrices parseável. Sem correção
     # automática possível (é decisão do operador), então alerta aqui — só
-    # no ciclo de 30min, não no run_execution de 5min, pra não spammar
-    # Telegram sobre a mesma posição parada a cada 5 minutos.
-    stuck = find_positions_needing_manual_resolution(DB_PATH)
-    if not stuck.empty:
-        console.print(f"[bold red]Posições precisando de revisão manual: {len(stuck)}[/bold red]")
-        try:
-            from notify import alert
-            questions = "; ".join(str(q)[:40] for q in stuck["question"].tolist())
-            alert(
-                f"{len(stuck)} posição(ões) fechada(s) sem outcome parseável, "
-                f"precisando revisão manual: {questions}",
-                cycle="paper_trader",
-            )
-        except Exception:
-            logger.exception("Falha ao notificar posições precisando de revisão manual")
+    # quando alert_manual_resolution=True (ciclo de 30min, não a cada 5min).
+    stuck = pd.DataFrame()
+    if alert_manual_resolution:
+        stuck = find_positions_needing_manual_resolution(DB_PATH)
+        if not stuck.empty:
+            try:
+                from notify import alert
+                questions = "; ".join(str(q)[:40] for q in stuck["question"].tolist())
+                alert(
+                    f"{len(stuck)} posição(ões) fechada(s) sem outcome parseável, "
+                    f"precisando revisão manual: {questions}",
+                    cycle="paper_trader",
+                )
+            except Exception:
+                logger.exception("Falha ao notificar posições precisando de revisão manual")
 
     # ── 2. Saída antecipada ────────────────────────────
+    early_exits: list = []
     open_pos = get_open_positions()
     if not open_pos.empty and not current_markets.empty:
         early_exits = early_exit_positions(open_pos, current_markets, DB_PATH, dry_run=dry_run)
         if early_exits:
-            console.print(f"[bold]Saídas antecipadas: {len(early_exits)}[/bold]")
-            for e in early_exits:
-                pnl_c = "green" if e["pnl_usdc"] >= 0 else "red"
-                console.print(
-                    f"  [{pnl_c}]EXIT[/{pnl_c}] {e['question'][:50]}"
-                    f" | [{pnl_c}]P&L=${e['pnl_usdc']:+.2f}[/{pnl_c}]"
-                    f" | {e['trigger']}"
-                )
             open_pos  = get_open_positions()
             portfolio = get_or_create_portfolio(initial_capital)
 
@@ -1195,52 +1189,44 @@ def run_paper_trading(
 
     stop, reason = check_drawdown_stop(portfolio, DB_PATH, total_value=total_value_for_stop, record=True)
     if stop:
-        console.print(f"\n[bold red]STOP LOSS ATIVADO: {reason}[/bold red]")
-        console.print("[dim]Novas posições, rebalance e baskets suspensos. Apenas monitorando portfólio atual.[/dim]\n")
-        print_portfolio(portfolio, mtm_for_stop if not mtm_for_stop.empty else pd.DataFrame())
-        return
+        return {
+            "portfolio": portfolio,
+            "positions_mtm": mtm_for_stop if not mtm_for_stop.empty else pd.DataFrame(),
+            "resolved": resolved, "orphans": orphans, "stuck": stuck,
+            "early_exits": early_exits, "stopped": True, "stop_reason": reason,
+            "rebalanced": [], "baskets": [], "opened_positions": [], "skipped": 0,
+            "signals_evaluated": 0,
+        }
 
     # ── 3b. Rebalanceamento de posições ─────────────────
+    rebalanced: list = []
     open_pos = get_open_positions()
     if not open_pos.empty and not current_markets.empty:
         open_pos_mtm = mark_to_market(open_pos, current_markets)
         rebalanced = rebalance_positions(open_pos_mtm, portfolio, dry_run=dry_run)
         if rebalanced:
-            console.print(f"[bold]Rebalanceamentos: {len(rebalanced)}[/bold]")
-            for r in rebalanced:
-                console.print(
-                    f"  [cyan]+${r['add_usdc']:.2f}[/cyan] {r['question'][:50]}"
-                    f" | edge={r['new_edge']:.1%}"
-                )
             open_pos  = get_open_positions()
             portfolio = get_or_create_portfolio(initial_capital)
 
     # ── 4.5 Baskets de arb estrutural (execução atômica) ──
     # Só baskets GARANTIDOS do CSV do scanner; cada basket abre todas as
     # pernas na mesma transação ou nenhuma (perna solta = direcional nua).
+    # Reavaliar o mesmo CSV a cada ciclo é seguro — open_basket() dedupe por
+    # condition_id já operado, então um basket já aberto é ignorado e só os
+    # que falharam (caixa insuficiente, preço evaporou) são retentados.
     baskets = open_arb_baskets(portfolio, current_markets, dry_run=dry_run)
     if baskets:
-        console.print(f"[bold]Baskets estruturais abertos: {len(baskets)}[/bold]")
-        for b in baskets:
-            console.print(
-                f"  [green]BASKET[/green] {b['arb_group']}"
-                f" | {b['n_legs']} pernas × {b['shares']:.1f} sh"
-                f" | custo ${b['total_cost']:.2f} → payout ${b['payout_total']:.2f}"
-                f" | [green]lucro garantido ${b['guaranteed_profit']:.2f}[/green]"
-            )
         open_pos  = get_open_positions()
         portfolio = get_or_create_portfolio(initial_capital)
 
     # ── 5. Carrega sinais ───────────────────────────────
     # min_edge é só pré-filtro coarse (MIN_EDGE_ABS por default); o gate fino
     # por fonte (MIN_EDGE_TO_TRADE) é aplicado pelo kelly_size ao abrir.
-    console.print(f"\nCarregando sinais ({mode.upper()})...")
     signals_df = load_signals(mode=mode, min_edge=edge_threshold)
+    opened_positions: list = []
+    skipped = signals_evaluated = 0
 
-    if signals_df.empty:
-        console.print(f"[yellow]Nenhum sinal disponível para modo '{mode}'.[/yellow]")
-        console.print(f"[dim]Execute: uv run python -m signals.run_signals --mode {mode}[/dim]\n")
-    else:
+    if not signals_df.empty:
         # Filtra por liquidez
         if "liquidity" in signals_df.columns:
             signals_df = signals_df[
@@ -1248,6 +1234,7 @@ def run_paper_trading(
             ]
 
         signals_top = signals_df.head(top_signals)
+        signals_evaluated = len(signals_top)
         # Pernas de arb não ocupam slots direcionais (mesma regra do check_exposure);
         # nem posições travadas esperando revisão manual (P1-16) — mercado já fechou.
         open_pos_for_slots = open_pos
@@ -1257,10 +1244,8 @@ def run_paper_trading(
             n_open = int((open_pos_for_slots["trade_type"].fillna("value") != "arb").sum())
         else:
             n_open = len(open_pos_for_slots) if not open_pos_for_slots.empty else 0
-        slots   = max(0, max_positions - n_open)
-        cash    = float(portfolio["current_cash"])
-
-        console.print(f"  Sinais disponíveis: {len(signals_top)} | Posições: {n_open}/{max_positions} | Caixa: ${cash:,.2f}\n")
+        slots = max(0, max_positions - n_open)
+        cash  = float(portfolio["current_cash"])
 
         # ── 6. Abre posições ────────────────────────────
         # P1-19: current_markets/traded_ids/open_pos içados pro chamador —
@@ -1275,7 +1260,6 @@ def run_paper_trading(
         # precisam do id de verdade e rodam com open_pos recarregado do
         # banco no próximo passo do ciclo, não com este).
         traded_ids = get_traded_condition_ids()
-        opened = skipped = 0
         for _, sig in signals_top.iterrows():
             if slots <= 0 or cash < 5:
                 break
@@ -1284,13 +1268,7 @@ def run_paper_trading(
                 current_markets=current_markets, open_positions=open_pos, traded_ids=traded_ids,
             )
             if pos:
-                dir_c = "green" if pos["direction"] == "BUY_YES" else "magenta"
-                console.print(
-                    f"  [{dir_c}]ABERTA[/{dir_c}] {str(sig.get('question',''))[:48]}"
-                    f" | ${pos['cost_usdc']:.2f} @ {pos['entry_price']:.3f}"
-                    f" | edge={pos['edge_at_entry']:.3f} conf={pos['confidence']:.2f}"
-                )
-                opened += 1
+                opened_positions.append(pos)
                 slots  -= 1
                 cash   -= pos["cost_usdc"]
                 portfolio["current_cash"] = cash
@@ -1303,12 +1281,7 @@ def run_paper_trading(
             else:
                 skipped += 1
 
-        if opened:
-            console.print(f"\n[green]{opened} posição(ões) aberta(s)[/green]  ({skipped} rejeitadas — ver logs INFO para motivo)\n")
-        else:
-            console.print(f"[dim]Nenhuma posição nova — {skipped} sinais rejeitados. Motivos nos logs (INFO).[/dim]\n")
-
-    # ── 7. Mark-to-market e exibição ───────────────────
+    # ── 7. Mark-to-market final ─────────────────────────
     open_pos = get_open_positions()
     if not open_pos.empty and not current_markets.empty:
         positions_mtm = mark_to_market(open_pos, current_markets)
@@ -1319,6 +1292,112 @@ def run_paper_trading(
         row = conn.execute("SELECT * FROM portfolio ORDER BY id DESC LIMIT 1").fetchone()
         portfolio = dict(row)
 
+    return {
+        "portfolio": portfolio, "positions_mtm": positions_mtm,
+        "resolved": resolved, "orphans": orphans, "stuck": stuck,
+        "early_exits": early_exits, "stopped": False, "stop_reason": None,
+        "rebalanced": rebalanced, "baskets": baskets,
+        "opened_positions": opened_positions, "skipped": skipped,
+        "signals_evaluated": signals_evaluated,
+    }
+
+
+def run_paper_trading(
+    initial_capital: float = 1_000.0,
+    max_positions: int | None = None,
+    edge_threshold: float | None = None,
+    min_liquidity: float | None = None,
+    dry_run: bool = False,
+    top_signals: int | None = None,
+    mode: str = "odds",
+) -> None:
+    """
+    Wrapper de CLI (30min, via run_cycle.py) sobre execute_cycle() — R2.
+    Cuida só do que é exclusivo desta cadência: saída colorida no terminal,
+    resumo de exposição por categoria/fonte e o CSV do portfólio.
+    """
+    from risk.risk_manager import portfolio_risk_summary
+
+    console.print(f"\n[bold]Paper Trader — capital: ${initial_capital:,.0f} USDC | modo: {mode.upper()}[/bold]")
+    if dry_run:
+        console.print("[yellow][DRY RUN] Nenhuma posição será salva.[/yellow]\n")
+    console.print(f"\nCarregando sinais ({mode.upper()})...")
+
+    result = execute_cycle(
+        initial_capital=initial_capital, max_positions=max_positions,
+        edge_threshold=edge_threshold, min_liquidity=min_liquidity,
+        top_signals=top_signals, mode=mode, dry_run=dry_run,
+        alert_manual_resolution=True,
+    )
+
+    if result["resolved"]:
+        console.print(f"[bold]Posições resolvidas: {len(result['resolved'])}[/bold]")
+        for r in result["resolved"]:
+            pnl_c = "green" if r["pnl_usdc"] >= 0 else "red"
+            console.print(
+                f"  [{pnl_c}]{r['status'].upper()}[/{pnl_c}] "
+                f"{r['question'][:50]} | "
+                f"[{pnl_c}]P&L=${r['pnl_usdc']:+.2f}[/{pnl_c}]"
+            )
+
+    if result["orphans"]:
+        console.print(f"[bold yellow]Pernas de arb órfãs reclassificadas: {len(result['orphans'])}[/bold yellow]")
+
+    if not result["stuck"].empty:
+        console.print(f"[bold red]Posições precisando de revisão manual: {len(result['stuck'])}[/bold red]")
+
+    if result["early_exits"]:
+        console.print(f"[bold]Saídas antecipadas: {len(result['early_exits'])}[/bold]")
+        for e in result["early_exits"]:
+            pnl_c = "green" if e["pnl_usdc"] >= 0 else "red"
+            console.print(
+                f"  [{pnl_c}]EXIT[/{pnl_c}] {e['question'][:50]}"
+                f" | [{pnl_c}]P&L=${e['pnl_usdc']:+.2f}[/{pnl_c}]"
+                f" | {e['trigger']}"
+            )
+
+    if result["stopped"]:
+        console.print(f"\n[bold red]STOP LOSS ATIVADO: {result['stop_reason']}[/bold red]")
+        console.print("[dim]Novas posições, rebalance e baskets suspensos. Apenas monitorando portfólio atual.[/dim]\n")
+        print_portfolio(result["portfolio"], result["positions_mtm"])
+        return
+
+    if result["rebalanced"]:
+        console.print(f"[bold]Rebalanceamentos: {len(result['rebalanced'])}[/bold]")
+        for r in result["rebalanced"]:
+            console.print(
+                f"  [cyan]+${r['add_usdc']:.2f}[/cyan] {r['question'][:50]}"
+                f" | edge={r['new_edge']:.1%}"
+            )
+
+    if result["baskets"]:
+        console.print(f"[bold]Baskets estruturais abertos: {len(result['baskets'])}[/bold]")
+        for b in result["baskets"]:
+            console.print(
+                f"  [green]BASKET[/green] {b['arb_group']}"
+                f" | {b['n_legs']} pernas × {b['shares']:.1f} sh"
+                f" | custo ${b['total_cost']:.2f} → payout ${b['payout_total']:.2f}"
+                f" | [green]lucro garantido ${b['guaranteed_profit']:.2f}[/green]"
+            )
+
+    if result["signals_evaluated"] == 0:
+        console.print(f"[yellow]Nenhum sinal disponível para modo '{mode}'.[/yellow]")
+        console.print(f"[dim]Execute: uv run python -m signals.run_signals --mode {mode}[/dim]\n")
+    else:
+        console.print(f"  Sinais avaliados: {result['signals_evaluated']}\n")
+        for pos in result["opened_positions"]:
+            dir_c = "green" if pos["direction"] == "BUY_YES" else "magenta"
+            console.print(
+                f"  [{dir_c}]ABERTA[/{dir_c}] {str(pos.get('question',''))[:48]}"
+                f" | ${pos['cost_usdc']:.2f} @ {pos['entry_price']:.3f}"
+                f" | edge={pos['edge_at_entry']:.3f} conf={pos['confidence']:.2f}"
+            )
+        if result["opened_positions"]:
+            console.print(f"\n[green]{len(result['opened_positions'])} posição(ões) aberta(s)[/green]  ({result['skipped']} rejeitadas — ver logs INFO para motivo)\n")
+        else:
+            console.print(f"[dim]Nenhuma posição nova — {result['skipped']} sinais rejeitados. Motivos nos logs (INFO).[/dim]\n")
+
+    portfolio, positions_mtm = result["portfolio"], result["positions_mtm"]
     print_portfolio(portfolio, positions_mtm)
 
     # Sumário de risco — usa as posições COM mark-to-market, senão o

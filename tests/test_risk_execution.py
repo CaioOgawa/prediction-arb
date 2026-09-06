@@ -2421,87 +2421,141 @@ class TestDrawdownPico:
         assert n_rows == 1  # só o record=True acima gravou — a checagem não
 
 
-class TestRunExecutionGuardas:
-    """P1-13: run_execution.py negociava sem check_drawdown_stop, piso de
-    liquidez, budget de slots ou cap de sinais por ciclo — as quatro guardas
-    que run_paper_trading já tinha. Teste de fumaça sobre o código-fonte
-    (main() é um comando click com efeitos colaterais de import pesados
-    demais pra rodar ponta a ponta em unit test)."""
+class TestRunExecutionLock:
+    """R2: run_cycle.py já tinha esse lock (P1-20); run_execution.py roda 6x
+    mais rápido (5min) e não tinha proteção nenhuma contra execução
+    sobreposta — uma chamada de rede pendurada empilharia o próximo tick
+    mutando as mesmas posições ao mesmo tempo. O lock é exclusivo deste
+    entrypoint (run_paper_trader.py não tem o seu — quem protege o ciclo de
+    30min é o lock do run_cycle.py, um nível acima), então continua sendo
+    verificado no código-fonte de run_execution.py, não em execute_cycle()."""
 
     SRC = (ROOT / "run_execution.py").read_text()
 
-    def test_chama_check_drawdown_stop_com_total_value(self):
-        assert "check_drawdown_stop" in self.SRC
-        assert "total_value=total_value_for_stop" in self.SRC
-
-    def test_filtra_por_liquidez_minima(self):
-        # Comportamental: reproduz a expressão de filtro do arquivo (mesma
-        # forma que run_paper_trading usa) e confirma que ela de fato corta
-        # sinais abaixo do piso — não só que a constante aparece no arquivo.
-        assert "MIN_SIGNAL_LIQUIDITY" in self.SRC
-        signals = pd.DataFrame([
-            {"question": "ilíquido", "liquidity": 100.0},
-            {"question": "líquido", "liquidity": risk_manager.MIN_SIGNAL_LIQUIDITY + 1},
-        ])
-        filtered = signals[
-            pd.to_numeric(signals["liquidity"], errors="coerce").fillna(0) >= risk_manager.MIN_SIGNAL_LIQUIDITY
-        ]
-        assert list(filtered["question"]) == ["líquido"]
-
-    def test_respeita_budget_de_slots(self):
-        assert "MAX_OPEN_POSITIONS" in self.SRC
-        assert "slots -= 1" in self.SRC
-
-    def test_capa_sinais_por_ciclo(self):
-        assert "MAX_SIGNALS_PER_CYCLE" in self.SRC
-        assert "signals.head(MAX_SIGNALS_PER_CYCLE)" in self.SRC
-
-    def test_stop_bloqueia_rebalance_nao_so_abertura(self):
-        # O bug original: o halt só impedia abrir posição nova, rebalance
-        # rodava sem checar nada. A guarda de stop precisa vir ANTES do
-        # bloco de rebalanceamento no arquivo.
-        i_stop = self.SRC.index("check_drawdown_stop(portfolio, DB_PATH")
-        i_rebalance = self.SRC.index("rebalance_positions(open_pos_mtm, portfolio")
-        assert i_stop < i_rebalance
-
     def test_usa_flock_nao_bloqueante(self):
-        # R2: run_cycle.py já tinha esse lock (P1-20); run_execution.py roda
-        # 6x mais rápido (5min) e não tinha proteção nenhuma contra execução
-        # sobreposta — uma chamada de rede pendurada empilharia o próximo
-        # tick mutando as mesmas posições ao mesmo tempo.
         assert "fcntl.flock" in self.SRC
         assert "LOCK_EX | fcntl.LOCK_NB" in self.SRC
 
-    def test_slots_exclui_posicoes_travadas_pra_needs_manual_resolution(self):
-        # Mesmo filtro de paper_trader.run_paper_trading (P1-16): posição
-        # travada esperando revisão manual não deve inflar n_open aqui.
-        assert "needs_manual_resolution" in self.SRC
-        i_needs_manual = self.SRC.index('"needs_manual_resolution"')
-        i_slots = self.SRC.index("slots = max(0, MAX_OPEN_POSITIONS - n_open)")
-        assert i_needs_manual < i_slots
 
-    def test_abre_baskets_de_arb_estrutural(self):
-        # R2: antes só rodava em run_paper_trading (30min) — um basket que
-        # falhasse abrir não era retentado nos ticks de 5min intermediários.
-        # open_basket() já dedupe por condition_id operado, então reavaliar
-        # o mesmo CSV a cada 5min é seguro.
-        assert "open_arb_baskets" in self.SRC
-        i_baskets = self.SRC.index("open_arb_baskets(portfolio, current_mkts")
-        i_signals = self.SRC.index("load_signals(mode=mode)")
-        assert i_baskets < i_signals  # baskets antes das posições direcionais
+@pytest.fixture()
+def execute_cycle_db(tmp_path, monkeypatch):
+    """DB isolado + mocks dos leitores de arquivo (mercados/sinais/baskets),
+    pra execute_cycle() nunca tocar dados reais de outputs/reports/ (há CSVs
+    de produção de verdade nesse diretório — ver P2-45)."""
+    db = tmp_path / "paper.db"
+    monkeypatch.setattr(paper_trader, "DB_PATH", db)
+    paper_trader.init_db()
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO portfolio (initial_capital, current_cash) VALUES (1000, 1000)")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(paper_trader, "load_current_markets", lambda: pd.DataFrame())
+    monkeypatch.setattr(paper_trader, "open_arb_baskets", lambda *a, **kw: [])
+    return db
 
 
-class TestPaperTraderStopAntesDoRebalance:
-    """P1-12: mesmo bug de ordem existia em run_paper_trading — rebalance
-    (que injeta mais capital em posições já perdedoras) rodava ANTES da
-    checagem de stop loss, então um halt nunca protegia o rebalance."""
+def _cycle_signal(condition_id="0xnovo", liquidity=10_000.0):
+    return {
+        "condition_id": condition_id, "question": f"Teste {condition_id}?", "underlying": "",
+        "direction": "BUY_YES", "yes_price": 0.50, "edge": 0.15, "prob_yes": 0.65,
+        "confidence": 1.0, "signal_source": "odds", "trade_type": "value",
+        "spread": 0.06, "liquidity": liquidity,
+    }
 
-    SRC = (ROOT / "execution" / "paper_trader.py").read_text()
 
-    def test_stop_vem_antes_do_rebalance_no_ciclo(self):
-        i_stop = self.SRC.index("check_drawdown_stop(portfolio, DB_PATH")
-        i_rebalance = self.SRC.index("rebalance_positions(open_pos_mtm, portfolio, dry_run=dry_run)")
-        assert i_stop < i_rebalance
+class TestExecuteCycle:
+    """R2: run_paper_trading() (30min) e run_execution.py::main() (5min)
+    duplicavam a mesma lógica de trading e já divergiram 3 vezes (commits
+    bf7e85b, e3f4276). execute_cycle() é o núcleo único que os dois agora
+    chamam — estes testes rodam a função de ponta a ponta contra um DB real
+    (não regex sobre o texto-fonte, que não pega regressão de lógica) e
+    travam exatamente as duas coisas que distinguem as duas cadências:
+    o alerta de posição travada (só no ciclo de 30min) e o comportamento
+    idêntico de tudo o mais."""
+
+    def test_sinal_fresco_e_liquido_abre_posicao_e_debita_cash(self, execute_cycle_db, monkeypatch):
+        monkeypatch.setattr(paper_trader, "load_signals", lambda **kw: pd.DataFrame([_cycle_signal()]))
+
+        result = paper_trader.execute_cycle(min_liquidity=0)
+
+        assert len(result["opened_positions"]) == 1
+        assert result["opened_positions"][0]["condition_id"] == "0xnovo"
+        conn = sqlite3.connect(execute_cycle_db)
+        cash = conn.execute("SELECT current_cash FROM portfolio ORDER BY id DESC LIMIT 1").fetchone()[0]
+        n_positions = conn.execute("SELECT COUNT(*) FROM positions WHERE status='open'").fetchone()[0]
+        conn.close()
+        assert n_positions == 1
+        assert cash == pytest.approx(1000.0 - result["opened_positions"][0]["cost_usdc"])
+
+    def test_alert_manual_resolution_controla_o_alerta_de_posicao_travada(self, execute_cycle_db, monkeypatch):
+        import notify
+        monkeypatch.setattr(paper_trader, "load_signals", lambda **kw: pd.DataFrame())
+        conn = sqlite3.connect(execute_cycle_db)
+        conn.execute("""
+            INSERT INTO positions
+              (condition_id, question, direction, entry_price, shares, cost_usdc,
+               status, needs_manual_resolution)
+            VALUES ('0xtravada', 'Travada?', 'BUY_YES', 0.5, 10, 5, 'open', 1)
+        """)
+        conn.commit(); conn.close()
+
+        sent = []
+        monkeypatch.setattr(notify, "_send", lambda text: sent.append(text) or True)
+
+        paper_trader.execute_cycle(alert_manual_resolution=False)
+        assert sent == [], "alert_manual_resolution=False não deveria alertar sobre posição travada"
+
+        paper_trader.execute_cycle(alert_manual_resolution=True)
+        assert len(sent) == 1, "alert_manual_resolution=True deveria alertar uma vez"
+        assert "revisão manual" in sent[0]
+
+    def test_drawdown_stop_bloqueia_rebalance_e_abertura(self, execute_cycle_db, monkeypatch):
+        monkeypatch.setattr(paper_trader, "load_signals", lambda **kw: pd.DataFrame([_cycle_signal()]))
+        monkeypatch.setattr(risk_manager, "check_drawdown_stop", lambda *a, **kw: (True, "teste de halt"))
+
+        result = paper_trader.execute_cycle(min_liquidity=0, alert_manual_resolution=True)
+
+        assert result["stopped"] is True
+        assert result["stop_reason"] == "teste de halt"
+        assert result["opened_positions"] == []
+        assert result["rebalanced"] == []
+        conn = sqlite3.connect(execute_cycle_db)
+        cash = conn.execute("SELECT current_cash FROM portfolio ORDER BY id DESC LIMIT 1").fetchone()[0]
+        n_positions = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+        conn.close()
+        assert cash == 1000.0  # nada debitado — parou antes de qualquer abertura
+        assert n_positions == 0
+
+    def test_filtro_de_liquidez_e_cap_de_sinais_por_ciclo(self, execute_cycle_db, monkeypatch):
+        signals = pd.DataFrame([
+            _cycle_signal("0xilíquido", liquidity=10.0),
+            _cycle_signal("0xa", liquidity=10_000.0),
+            _cycle_signal("0xb", liquidity=10_000.0),
+            _cycle_signal("0xc", liquidity=10_000.0),
+        ])
+        monkeypatch.setattr(paper_trader, "load_signals", lambda **kw: signals)
+
+        result = paper_trader.execute_cycle(min_liquidity=5_000.0, top_signals=2)
+
+        # 3 sinais líquidos (0xilíquido cai fora), cap de 2 por ciclo — só os
+        # 2 primeiros pós-filtro são avaliados, "0xc" nem chega a ser tentado.
+        assert result["signals_evaluated"] == 2
+        assert len(result["opened_positions"]) == 2
+        assert {p["condition_id"] for p in result["opened_positions"]} == {"0xa", "0xb"}
+
+    def test_dry_run_nao_persiste_nada(self, execute_cycle_db, monkeypatch):
+        monkeypatch.setattr(paper_trader, "load_signals", lambda **kw: pd.DataFrame([_cycle_signal()]))
+
+        result = paper_trader.execute_cycle(min_liquidity=0, dry_run=True)
+
+        assert len(result["opened_positions"]) == 1  # open_position devolve o dict mesmo em dry-run
+        conn = sqlite3.connect(execute_cycle_db)
+        cash = conn.execute("SELECT current_cash FROM portfolio ORDER BY id DESC LIMIT 1").fetchone()[0]
+        n_positions = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+        conn.close()
+        assert cash == 1000.0
+        assert n_positions == 0
 
 
 class TestRunPaperTraderCliNaoDuplicaConstanteDoRiskManager:
@@ -3460,13 +3514,11 @@ class TestOpenPositionRecebeSnapshotsDoChamador:
         # colunas, incluindo status) sem "status" no dict apendado deixava
         # NaN em status pra essa linha — a mesma classe de bug do P1-17
         # (str(nan)=='nan' furando .get/comparação rio abaixo). Smoke test
-        # de código-fonte: os dois pontos onde o loop apenda a posição
-        # recém-aberta precisam fixar status="open" explicitamente.
-        for path, marker in [
-            (ROOT / "execution" / "paper_trader.py", '{**pos, "status": "open"'),
-            (ROOT / "run_execution.py", '{**result, "status": "open"'),
-        ]:
-            assert marker in path.read_text(), f"{path.name} sem status fixo na linha apendada"
+        # de código-fonte: desde o R2, o único loop que apenda a posição
+        # recém-aberta é execute_cycle() (compartilhado por run_paper_trading
+        # e run_execution) e precisa fixar status="open" explicitamente.
+        src = (ROOT / "execution" / "paper_trader.py").read_text()
+        assert '{**pos, "status": "open"' in src, "execute_cycle sem status fixo na linha apendada"
 
 
 class TestRunCycleTimeoutELock:
