@@ -75,6 +75,43 @@ def fetch_price_history(
     return df[["timestamp", "token_id", "price"]].sort_values("timestamp").reset_index(drop=True)
 
 
+def fetch_market_by_condition_id(condition_id: str) -> dict | None:
+    """
+    Busca um mercado específico direto pelo condition_id via CLOB API.
+    Endpoint público — não requer autenticação.
+
+    Existe pra cobrir o ponto cego do fetch em lote (gamma_collector.fetch_markets,
+    active=True/closed=false): um mercado que já resolveu nunca aparece nesse
+    snapshot, então uma posição aberta nele nunca é vista por resolve_positions
+    (ver P3-46). Aqui, consultando por ID, o mercado resolvido vem normalmente.
+
+    Retorna dict no formato que resolve_positions espera (conditionId, closed,
+    endDate, outcomePrices como [p_yes, p_no]), ou None se a API falhar ou o
+    mercado não tiver os dois tokens YES/NO esperados.
+    """
+    try:
+        resp = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=10)
+        resp.raise_for_status()
+        mkt = resp.json()
+    except requests.RequestException as e:
+        logger.warning(f"Erro ao buscar mercado {condition_id[:16]}: {e}")
+        return None
+
+    tokens = mkt.get("tokens", [])
+    yes_price = next((t.get("price") for t in tokens if t.get("outcome") == "Yes"), None)
+    no_price  = next((t.get("price") for t in tokens if t.get("outcome") == "No"), None)
+    if yes_price is None or no_price is None:
+        return None
+
+    return {
+        "conditionId":   mkt.get("condition_id", condition_id),
+        "closed":        bool(mkt.get("closed", False)),
+        "endDate":       mkt.get("end_date_iso"),
+        "outcomePrices": [float(yes_price), float(no_price)],
+        "question":      mkt.get("question", ""),
+    }
+
+
 def fetch_orderbook_snapshot(token_id: str) -> dict | None:
     """
     Captura snapshot atual do orderbook de um token.

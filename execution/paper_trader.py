@@ -243,6 +243,45 @@ def load_current_markets() -> pd.DataFrame:
     return pd.read_parquet(newest)
 
 
+def enrich_markets_for_resolution(
+    open_positions: pd.DataFrame, current_markets: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Completa current_markets com os mercados de posições abertas que já
+    resolveram, pra resolve_positions conseguir vê-las (P3-46).
+
+    current_markets vem de gamma_collector.fetch_markets(active=True), que
+    filtra closed=false — um mercado que resolveu nunca aparece nesse
+    snapshot, então a posição aberta nele fica invisível pra resolve_positions
+    indefinidamente (achado em produção: 19 posições, $195, até 2,5 meses
+    travadas). Só consulta a CLOB por condition_id que falta no snapshot —
+    tipicamente poucos, encolhe a cada resolução.
+    """
+    if open_positions.empty or current_markets.empty:
+        return current_markets
+
+    known_cids = set(current_markets["conditionId"].astype(str))
+    missing = [
+        cid for cid in open_positions["condition_id"].astype(str).unique()
+        if cid not in known_cids
+    ]
+    if not missing:
+        return current_markets
+
+    from pipeline.clob_collector import fetch_market_by_condition_id
+
+    extra_rows = []
+    for cid in missing:
+        mkt = fetch_market_by_condition_id(cid)
+        if mkt:
+            extra_rows.append(mkt)
+
+    if not extra_rows:
+        return current_markets
+
+    return pd.concat([current_markets, pd.DataFrame(extra_rows)], ignore_index=True)
+
+
 def load_signals(mode: str = "odds", min_edge: float | None = None) -> pd.DataFrame:
     """
     Carrega os sinais mais recentes do modo especificado.
@@ -1155,7 +1194,8 @@ def execute_cycle(
     # ── 1. Resolve posições ─────────────────────────────
     resolved: list = []
     if not open_pos.empty and not current_markets.empty:
-        resolved = resolve_positions(open_pos, current_markets, DB_PATH, dry_run=dry_run)
+        markets_for_resolution = enrich_markets_for_resolution(open_pos, current_markets)
+        resolved = resolve_positions(open_pos, markets_for_resolution, DB_PATH, dry_run=dry_run)
         if resolved:
             open_pos  = get_open_positions()
             portfolio = get_or_create_portfolio(initial_capital)

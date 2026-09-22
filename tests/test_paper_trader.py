@@ -76,3 +76,69 @@ class TestLoadCurrentMarkets:
     def test_sem_candidatos_devolve_vazio(self, tmp_mkt_dir):
         df = paper_trader.load_current_markets()
         assert df.empty
+
+
+class TestEnrichMarketsForResolution:
+    """
+    P3-46: current_markets vem de um fetch com closed=false — um mercado que
+    já resolveu nunca aparece nele, então uma posição aberta nesse mercado
+    fica invisível pra resolve_positions pra sempre. enrich_markets_for_resolution
+    completa o buraco consultando a CLOB só pelos condition_id que faltam.
+    """
+
+    def test_completa_condition_id_ausente_via_clob(self, monkeypatch):
+        open_positions = pd.DataFrame({"condition_id": ["0xaaa", "0xbbb"]})
+        current_markets = pd.DataFrame({"conditionId": ["0xaaa"], "closed": [False]})
+
+        def fake_fetch(cid):
+            assert cid == "0xbbb"
+            return {
+                "conditionId": "0xbbb", "closed": True,
+                "endDate": "2026-01-01T00:00:00Z", "outcomePrices": [1.0, 0.0],
+                "question": "resolvido",
+            }
+
+        monkeypatch.setattr(
+            "pipeline.clob_collector.fetch_market_by_condition_id", fake_fetch
+        )
+
+        result = paper_trader.enrich_markets_for_resolution(open_positions, current_markets)
+
+        assert set(result["conditionId"]) == {"0xaaa", "0xbbb"}
+        row = result[result["conditionId"] == "0xbbb"].iloc[0]
+        assert bool(row["closed"]) is True
+        assert row["outcomePrices"] == [1.0, 0.0]
+
+    def test_sem_posicao_orfa_nao_chama_clob(self, monkeypatch):
+        open_positions = pd.DataFrame({"condition_id": ["0xaaa"]})
+        current_markets = pd.DataFrame({"conditionId": ["0xaaa"], "closed": [False]})
+
+        def fail_if_called(cid):
+            raise AssertionError("não deveria consultar a CLOB sem posição órfã")
+
+        monkeypatch.setattr(
+            "pipeline.clob_collector.fetch_market_by_condition_id", fail_if_called
+        )
+
+        result = paper_trader.enrich_markets_for_resolution(open_positions, current_markets)
+
+        assert len(result) == 1
+
+    def test_falha_na_clob_nao_quebra_e_ignora_posicao(self, monkeypatch):
+        open_positions = pd.DataFrame({"condition_id": ["0xaaa", "0xbbb"]})
+        current_markets = pd.DataFrame({"conditionId": ["0xaaa"], "closed": [False]})
+
+        monkeypatch.setattr(
+            "pipeline.clob_collector.fetch_market_by_condition_id", lambda cid: None
+        )
+
+        result = paper_trader.enrich_markets_for_resolution(open_positions, current_markets)
+
+        assert set(result["conditionId"]) == {"0xaaa"}
+
+    def test_open_positions_ou_current_markets_vazio_devolve_current_markets(self):
+        current_markets = pd.DataFrame({"conditionId": ["0xaaa"], "closed": [False]})
+
+        result = paper_trader.enrich_markets_for_resolution(pd.DataFrame(), current_markets)
+
+        assert result is current_markets
