@@ -87,7 +87,14 @@ def fetch_market_by_condition_id(condition_id: str) -> dict | None:
 
     Retorna dict no formato que resolve_positions espera (conditionId, closed,
     endDate, outcomePrices como [p_yes, p_no]), ou None se a API falhar ou o
-    mercado não tiver os dois tokens YES/NO esperados.
+    mercado não tiver exatamente 2 tokens.
+
+    YES/NO aqui é POSIÇÃO no array de tokens (índice 0/1), não o texto de
+    `outcome` — mercado de esporte rotula outcome com nome de time
+    ("San Diego Padres"/"Toronto Blue Jays"), não "Yes"/"No" literal. Mesma
+    convenção que `clobTokenIds`/`outcomePrices` já usam no resto do
+    pipeline (gamma_collector.py), preservada aqui pra outcome[0] concordar
+    com o "YES" que build_asset_map()/BUY_YES já assumem.
     """
     try:
         resp = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=10)
@@ -98,8 +105,9 @@ def fetch_market_by_condition_id(condition_id: str) -> dict | None:
         return None
 
     tokens = mkt.get("tokens", [])
-    yes_price = next((t.get("price") for t in tokens if t.get("outcome") == "Yes"), None)
-    no_price  = next((t.get("price") for t in tokens if t.get("outcome") == "No"), None)
+    if len(tokens) != 2:
+        return None
+    yes_price, no_price = tokens[0].get("price"), tokens[1].get("price")
     if yes_price is None or no_price is None:
         return None
 
