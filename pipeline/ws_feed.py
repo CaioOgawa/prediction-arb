@@ -445,6 +445,12 @@ async def ws_loop(
             ) as ws:
                 logger.info(f"Conectado: {WS_URI}")
                 backoff = BACKOFF_MIN
+                # Conexão nova: força refresh+subscribe já no primeiro loop,
+                # não espera o REFRESH_INTERVAL_S — sem isso, toda reconexão
+                # (erro ou deliberada, ver abaixo) ficava até 5min sem
+                # NENHUM token assinado nesta conexão.
+                last_refresh = 0.0
+                subscribed_position_tokens: set[str] | None = None
 
                 while not stop_event.is_set():
                     now = asyncio.get_event_loop().time()
@@ -453,10 +459,28 @@ async def ws_loop(
                     if now - last_refresh > REFRESH_INTERVAL_S:
                         asset_map   = build_asset_map()
                         exited_ids &= {v.position_id for v in asset_map.values()}  # limpa IDs antigos
-                        tokens       = list(asset_map.keys())[:MAX_TOKENS_PER_SUB]
+                        position_tokens = {k for k, v in asset_map.items() if v.position_id > 0}
+
+                        # P3-46b: resubscribe ("assets_ids") na MESMA conexão
+                        # não reenvia o snapshot inicial de book pro token
+                        # novo — só conexão nova recebe (confirmado em
+                        # produção: 6min sem 1 tick após abrir posição,
+                        # <1s depois de reconectar). Sem isso, posição aberta
+                        # entre reconexões nunca tem exit avaliado até a
+                        # próxima queda de conexão — podem ser horas, já que
+                        # a conexão fica estável com ping/pong.
+                        if subscribed_position_tokens is not None and \
+                                not position_tokens <= subscribed_position_tokens:
+                            logger.info(
+                                "Posição nova fora do snapshot desta conexão — reconectando"
+                            )
+                            break
+
+                        tokens = list(asset_map.keys())[:MAX_TOKENS_PER_SUB]
                         if tokens:
                             await ws.send(json.dumps({"assets_ids": tokens, "type": "market"}))
                             logger.info(f"Subscrito a {len(tokens)} tokens")
+                        subscribed_position_tokens = position_tokens
                         last_refresh = now
 
                     # Aguarda próximo frame — retorna imediatamente se há mensagem
